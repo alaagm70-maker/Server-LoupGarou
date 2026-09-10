@@ -1,3 +1,8 @@
+/* =========================================================
+   Loup Garou — server.js
+   يطابق البروتوكول اللي كيستعملو olders.html (room:*, game:*, night:*, vote:*, chat:*)
+   + نظام Creator آمن (السر فالسيرفر فقط، عبر متغير بيئة)
+   ========================================================= */
 const express = require('express');
 const app = express();
 const http = require('http').createServer(app);
@@ -7,142 +12,85 @@ const io = require('socket.io')(http, {
 
 app.use(express.static(__dirname));
 
-// ══════════════════════════════════════
-//  الأدوار
-// ══════════════════════════════════════
-const ROLES = {
-  VILLAGER:  { name:'فلاح',         emoji:'🧑‍🌾', color:'#2ecc71', desc:'يصوّت نهارًا فقط',       wolf:false },
-  WEREWOLF:  { name:'مستذئب',       emoji:'🐺',   color:'#e74c3c', desc:'يقتل كل ليلة',           wolf:true  },
-  ALPHA_WOLF:{ name:'ذئب ألفا',     emoji:'🔥🐺', color:'#ff4444', desc:'الذئب الأقوى',           wolf:true  },
-  SEER:      { name:'عرّافة',       emoji:'🔮',   color:'#9b59b6', desc:'ترى هوية لاعب كل ليلة',  wolf:false },
-  WITCH:     { name:'ساحرة',        emoji:'🧙',   color:'#1abc9c', desc:'ترياق + سم مرة واحدة',   wolf:false },
-  HUNTER:    { name:'صيّاد',        emoji:'🏹',   color:'#f1c40f', desc:'سهم أخير عند الموت',     wolf:false },
-  BODYGUARD: { name:'حارس',         emoji:'🛡️',  color:'#3498db', desc:'يحمي لاعبًا كل ليلة',    wolf:false },
-  CUPID:     { name:'كيوبيد',       emoji:'💘',   color:'#e91e63', desc:'يربط عاشقَين',           wolf:false },
-  ELDER:     { name:'شيخ القرية',   emoji:'👴',   color:'#a0522d', desc:'يتحمل ضربة من الذئاب',   wolf:false },
-  FOOL:      { name:'المجنون',      emoji:'🃏',   color:'#00bcd4', desc:'يفوز إن أُعدم نهارًا',   wolf:false },
-  PLAGUE_DR: { name:'طبيب الطاعون', emoji:'⚗️',  color:'#7f8c8d', desc:'يمرّض لاعبًا',           wolf:false },
-  THIEF:     { name:'اللص',         emoji:'🥷',   color:'#e67e22', desc:'يسرق دور لاعب آخر',      wolf:false },
-};
+/* ------------------------------------------------------------
+   Creator auth (آمن): السر كيتقارن فالسيرفر فقط.
+   خاصك تصاوب متغير بيئة قبل التشغيل، مثلاً:
+     CREATOR_SECRET=IAM-ALAA-DEVOFLOUPPY node server.js
+   ------------------------------------------------------------ */
+const CREATOR_SECRET = process.env.CREATOR_SECRET || null;
 
-const BASE_ROLES = {
-  4:  ['WEREWOLF','SEER','WITCH','VILLAGER'],
-  5:  ['WEREWOLF','SEER','WITCH','HUNTER','VILLAGER'],
-  6:  ['WEREWOLF','WEREWOLF','SEER','WITCH','ELDER','VILLAGER'],
-  7:  ['WEREWOLF','WEREWOLF','SEER','WITCH','HUNTER','ELDER','VILLAGER'],
-  8:  ['WEREWOLF','WEREWOLF','SEER','WITCH','HUNTER','BODYGUARD','CUPID','VILLAGER'],
-  9:  ['WEREWOLF','WEREWOLF','ALPHA_WOLF','SEER','WITCH','HUNTER','BODYGUARD','CUPID','VILLAGER'],
-  10: ['WEREWOLF','WEREWOLF','ALPHA_WOLF','SEER','WITCH','HUNTER','BODYGUARD','CUPID','FOOL','VILLAGER'],
-  11: ['WEREWOLF','WEREWOLF','ALPHA_WOLF','SEER','WITCH','HUNTER','BODYGUARD','CUPID','FOOL','THIEF','VILLAGER'],
-  12: ['WEREWOLF','WEREWOLF','ALPHA_WOLF','SEER','WITCH','HUNTER','BODYGUARD','CUPID','FOOL','THIEF','ELDER','PLAGUE_DR'],
-};
+// socket.id ديال أي واحد أثبت أنه Creator فهاد الجلسة الحالية ديال السيرفر
+const creatorSockets = new Set();
 
-function rolesForCount(n) {
-  if (n <= 4) return BASE_ROLES[4];
-  if (n >= 12) {
-    const roles = [...BASE_ROLES[12]];
-    while (roles.length < n) roles.push('VILLAGER');
-    return roles;
-  }
-  return BASE_ROLES[n];
+// IPs محظورة بشكل دائم (كتضيع لما يعاود يتشغل السيرفر — حسب الطلب)
+const permBannedIPs = new Set();
+// IPs محظورة مؤقتاً لهاد التشغيلة الحالية فقط لكن كتفرق عن permanent فكونها بلا فرق تقني هنا،
+// خصصنا set وحدة، والفرق كيبان غير فكيفاش كتزاد (شوف creator:ban)
+const sessionBannedIPs = new Set();
+
+function getClientIP(socket) {
+  const fwd = socket.handshake.headers['x-forwarded-for'];
+  if (fwd) return fwd.split(',')[0].trim();
+  return socket.handshake.address;
 }
 
-function shuffle(arr) {
-  const a = [...arr];
-  for (let i = a.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
-    [a[i], a[j]] = [a[j], a[i]];
-  }
-  return a;
+function isBannedIP(ip) {
+  return permBannedIPs.has(ip) || sessionBannedIPs.has(ip);
 }
 
-const AVATARS = ['🧑','👩','🧔','👨‍🦰','👩‍🦰','🧑‍🦱','👨‍🦳','👩‍🦳','🧑‍🦲','👨‍🎓','👩‍🎓','🧑‍🌾'];
-
-// ══════════════════════════════════════
-//  مكافحة السبام
-// ══════════════════════════════════════
-const RATE_LIMIT_WINDOW_MS = 4000;
-const RATE_LIMIT_MAX_EVENTS = 15;
-const WARN_THRESHOLD = 2;
-const socketMeta = new Map();
-
-function getMeta(socketId) {
-  if (!socketMeta.has(socketId)) socketMeta.set(socketId, { events: [], warnings: 0 });
-  return socketMeta.get(socketId);
+function isCreator(socket) {
+  return CREATOR_SECRET && creatorSockets.has(socket.id);
 }
 
-function checkRateLimit(socket, eventName) {
-  const meta = getMeta(socket.id);
-  const now = Date.now();
-  meta.events = meta.events.filter(t => now - t < RATE_LIMIT_WINDOW_MS);
-  meta.events.push(now);
-
-  if (meta.events.length > RATE_LIMIT_MAX_EVENTS) {
-    meta.warnings++;
-    meta.events = [];
-    console.log(`⚠️ سبام مرصود من ${socket.id} (${eventName}) — تحذير رقم ${meta.warnings}`);
-    if (meta.warnings >= WARN_THRESHOLD) {
-      socket.emit('room:error', 'يبدو انك قمت بمخالفة سياسات الأحكام مرة أخرى. تم طردك بسبب رسائل سريعة جداً.');
-      const room = findRoomBySocket(socket.id);
-      if (room) removePlayerFromRoom(room, socket.id, true);
-      socket.disconnect(true);
-      return false;
-    }
-    socket.emit('room:error', `رسائلك سريعة جداً. سيتم طردك إذا تكررت. (${meta.warnings}/${WARN_THRESHOLD})`);
+function requireCreator(socket, cb) {
+  if (!isCreator(socket)) {
+    socket.emit('creator:error', 'غير مصرح لك بهاد العملية');
     return false;
   }
+  cb();
   return true;
 }
 
-// ══════════════════════════════════════
-//  فلترة الدردشة
-// ══════════════════════════════════════
-const SOCIAL_PLATFORM_WORDS = [
-  'instagram','insta','ig','facebook','fb','whatsapp','wa','wsp','telegram','tg','tele',
-  'snapchat','snap','tiktok','tik tok','twitter','x','discord','disc','dc',
-  'messenger','msngr','youtube','yt','linkedin','wechat','line','viber','skype',
-  'signal','imo','kik','reddit','pinterest','threads',
-  'انستغرام','انستقرام','انستجرام','انستا','انستاجرام',
-  'فيسبوك','فايسبوك','فيس بوك','فيس',
-  'واتساب','واتس اب','واتسأب','وتساب',
-  'تيليجرام','تليجرام','تيلجرام','تلغرام',
-  'سناب شات','سناب',
-  'تيك توك','تكتوك','تيكتوك',
-  'ديسكورد','ديسكرد','ديس',
-  'ماسنجر','مسنجر',
-  'سكايب','فايبر','سيجنال','ثريدز','ريديت',
-  'انستا','سناپ','واتس','تيلي','ديسكورت',
-  'دسكراد','دسكرادود','دوسكرا','ديسكرادود','دساكر',
-  'دوس','دوسرا','دورادوس','ديسوداد','ديس ديس'
-];
+/* ------------------------------------------------------------
+   الأدوار
+   ------------------------------------------------------------ */
+const ROLES_INFO = {
+  VILLAGER:   { name: 'فلاح',         emoji: '🧑‍🌾', color: '#2ecc71', desc: 'يصوّت نهارًا فقط',        wolf: false },
+  WEREWOLF:   { name: 'مستذئب',       emoji: '🐺',   color: '#e74c3c', desc: 'يقتل كل ليلة',            wolf: true },
+  ALPHA_WOLF: { name: 'ذئب ألفا',     emoji: '🔥🐺', color: '#ff4444', desc: 'الذئب الأقوى',            wolf: true },
+  SEER:       { name: 'عرّافة',        emoji: '🔮',   color: '#9b59b6', desc: 'ترى هوية لاعب كل ليلة',   wolf: false },
+  WITCH:      { name: 'ساحرة',        emoji: '🧙',   color: '#1abc9c', desc: 'ترياق + سم مرة واحدة',    wolf: false },
+  HUNTER:     { name: 'صيّاد',        emoji: '🏹',   color: '#f1c40f', desc: 'سهم أخير عند الموت',      wolf: false },
+  BODYGUARD:  { name: 'حارس',         emoji: '🛡️',  color: '#3498db', desc: 'يحمي لاعبًا كل ليلة',      wolf: false },
+  CUPID:      { name: 'كيوبيد',       emoji: '💘',   color: '#e91e63', desc: 'يربط عاشقَين',            wolf: false },
+  ELDER:      { name: 'شيخ القرية',   emoji: '👴',   color: '#a0522d', desc: 'يتحمل ضربة من الذئاب',    wolf: false },
+  FOOL:       { name: 'المجنون',      emoji: '🃏',   color: '#00bcd4', desc: 'يفوز إن أُعدم نهارًا',    wolf: false },
+  PLAGUE_DR:  { name: 'طبيب الطاعون', emoji: '⚗️',  color: '#7f8c8d', desc: 'يمرّض لاعبًا',            wolf: false },
+  THIEF:      { name: 'اللص',         emoji: '🥷',   color: '#e67e22', desc: 'يسرق دور لاعب آخر',       wolf: false },
+};
 
-const BAD_WORDS = [];
-function filterProfanity(text) {
-  let cleaned = text;
-  BAD_WORDS.forEach(w => {
-    if (!w) return;
-    cleaned = cleaned.replace(new RegExp(w, 'gi'), '*'.repeat(w.length));
-  });
-  return cleaned;
-}
+const ROLE_DIST = {
+  5:  ['WEREWOLF', 'SEER', 'WITCH', 'VILLAGER', 'VILLAGER'],
+  6:  ['WEREWOLF', 'WEREWOLF', 'SEER', 'WITCH', 'ELDER', 'VILLAGER'],
+  7:  ['WEREWOLF', 'WEREWOLF', 'SEER', 'WITCH', 'HUNTER', 'ELDER', 'VILLAGER'],
+  8:  ['WEREWOLF', 'WEREWOLF', 'SEER', 'WITCH', 'HUNTER', 'BODYGUARD', 'CUPID', 'VILLAGER'],
+  9:  ['WEREWOLF', 'WEREWOLF', 'ALPHA_WOLF', 'SEER', 'WITCH', 'HUNTER', 'BODYGUARD', 'CUPID', 'VILLAGER'],
+  10: ['WEREWOLF', 'WEREWOLF', 'ALPHA_WOLF', 'SEER', 'WITCH', 'HUNTER', 'BODYGUARD', 'CUPID', 'FOOL', 'VILLAGER'],
+  11: ['WEREWOLF', 'WEREWOLF', 'ALPHA_WOLF', 'SEER', 'WITCH', 'HUNTER', 'BODYGUARD', 'CUPID', 'FOOL', 'THIEF', 'VILLAGER'],
+  12: ['WEREWOLF', 'WEREWOLF', 'ALPHA_WOLF', 'SEER', 'WITCH', 'HUNTER', 'BODYGUARD', 'CUPID', 'FOOL', 'THIEF', 'ELDER', 'PLAGUE_DR'],
+};
 
-function normalizeForFilter(text) {
-  return text.toLowerCase().replace(/[\s\-_.*()\[\]{}|\\/+~`^!@#$%&=:;'"،,؛]+/g, '');
-}
+const MIN_PLAYERS = 5;
+const BOT_NAMES = ['سعيد', 'فاطمة', 'يوسف', 'خديجة', 'رشيد', 'سميرة', 'كريم', 'ليلى', 'عادل', 'نادية', 'حمزة', 'أمينة'];
+const BOT_AVATARS = ['🤖', '👽', '🐺', '🦊', '🐻', '🦁', '🐯', '🐸'];
 
-function containsExternalContact(text) {
-  const normalized = normalizeForFilter(text);
-  const linkPatterns = [/https?:\/\//i, /www\./i, /\.(com|net|org|me|ly|gg)\b/i];
-  if (linkPatterns.some(p => p.test(text))) return true;
-  if (SOCIAL_PLATFORM_WORDS.some(w => normalized.includes(w.toLowerCase()))) return true;
-  if (/@[a-zA-Z0-9_]{3,}/.test(text)) return true;
-  if (/\d{7,}/.test(normalized)) return true;
-  return false;
-}
+function shuffle(arr) { return arr.map(v => [Math.random(), v]).sort((a, b) => a[0] - b[0]).map(x => x[1]); }
+function makeId(prefix) { return prefix + '-' + Math.random().toString(36).slice(2, 10); }
+function roleInfo(key) { return ROLES_INFO[key] || ROLES_INFO.VILLAGER; }
 
-// ══════════════════════════════════════
-//  الغرف
-// ══════════════════════════════════════
+/* ------------------------------------------------------------
+   الغرف
+   ------------------------------------------------------------ */
 const rooms = new Map(); // code -> room
 
 function makeRoomCode() {
@@ -154,50 +102,49 @@ function makeRoomCode() {
   return code;
 }
 
-function newRoom(code, hostId) {
+function newRoom(hostSocketId) {
   return {
-    code,
-    host: hostId,
-    state: 'lobby', // lobby | playing | ended
-    phase: 'night',
+    code: makeRoomCode(),
+    hostId: hostSocketId,
+    state: 'lobby',        // lobby | playing | ended
+    phase: 'night',        // night | day
     day: 1,
-    players: [], // { id, name, avatar, role, alive, protected, sick, lover, elderLives, votedFor }
-    nightKill: null,        // wolf target id
-    nightGuard: null,       // bodyguard target id
+    players: [],           // {id,name,avatar,role,alive,isBot,votedFor,lover}
+    nightQueue: [],        // ترتيب الأدوار اللي خاصها تتصرف هاد الليلة
+    nightIndex: 0,
+    nightEvents: [],
+    nightKillTarget: null, // هدف الذئاب
+    guardedId: null,
     witchHeal: true,
     witchKill: true,
-    witchSaved: false,      // did witch heal tonight
-    witchPoisonTarget: null,
-    seerDone: false,
-    guardDone: false,
-    wolfDone: false,
-    witchDone: false,
-    cupidDone: false,
-    plagueDone: false,
-    plagueTarget: null,
-    nightEvents: [],
-    votingOpen: false,
-    voteTimeout: null,
+    plagueSickId: null,
+    lovers: null,          // [id1, id2]
+    thiefSwapped: false,
   };
 }
 
 function findRoomBySocket(socketId) {
   for (const room of rooms.values()) {
-    if (room.players.some(p => p.id === socketId)) return room;
+    if (room.players.find(p => p.id === socketId)) return room;
   }
   return null;
+}
+
+function alivePlayers(room) { return room.players.filter(p => p.alive); }
+function wolvesOf(room) { return alivePlayers(room).filter(p => roleInfo(p.role).wolf); }
+function villagersOf(room) { return alivePlayers(room).filter(p => !roleInfo(p.role).wolf); }
+
+function publicPlayer(p) {
+  return { id: p.id, name: p.name, avatar: p.avatar, alive: p.alive, isBot: !!p.isBot };
 }
 
 function roomPublicState(room) {
   return {
     code: room.code,
-    host: room.host,
     state: room.state,
     phase: room.phase,
     day: room.day,
-    players: room.players.map(p => ({
-      id: p.id, name: p.name, avatar: p.avatar, alive: p.alive,
-    })),
+    players: room.players.map(publicPlayer),
   };
 }
 
@@ -205,314 +152,207 @@ function broadcastRoom(room) {
   io.to(room.code).emit('room:update', roomPublicState(room));
 }
 
-function alivePlayers(room) { return room.players.filter(p => p.alive); }
-function aliveWolves(room) { return alivePlayers(room).filter(p => ROLES[p.role].wolf); }
-function aliveVillageSide(room) { return alivePlayers(room).filter(p => !ROLES[p.role].wolf); }
-
-function playerPublic(p) {
-  return { id: p.id, name: p.name, avatar: p.avatar };
-}
-
-function playerFull(p) {
-  return { id: p.id, name: p.name, avatar: p.avatar, role: p.role, alive: p.alive };
-}
-
-function checkWin(room) {
-  const wolves = aliveWolves(room);
-  const villagers = aliveVillageSide(room);
-  if (!wolves.length) return 'village';
-  if (wolves.length >= villagers.length) return 'wolves';
-  return null;
-}
-
-function endGame(room, winner) {
-  room.state = 'ended';
-  room.phase = 'end';
-  io.to(room.code).emit('game:end', {
-    winner,
-    players: room.players.map(playerFull),
-  });
-}
-
-function removePlayerFromRoom(room, socketId, silent) {
-  const idx = room.players.findIndex(p => p.id === socketId);
-  if (idx === -1) return;
-  const [left] = room.players.splice(idx, 1);
-  const sock = io.sockets.sockets.get(socketId);
-  if (sock) sock.leave(room.code);
-
-  if (room.players.length === 0) {
-    if (room.voteTimeout) clearTimeout(room.voteTimeout);
-    rooms.delete(room.code);
-    return;
-  }
-  if (room.host === socketId) {
-    room.host = room.players[0].id;
-  }
-  if (!silent) {
-    io.to(room.code).emit('chat:message', {
-      sender: 'النظام', avatar: '📢', text: `${left.name} غادر اللعبة`, system: true,
+function addBotsToRoom(room) {
+  const humanCount = room.players.filter(p => !p.isBot).length;
+  if (humanCount < 2) return;
+  const needed = Math.max(0, MIN_PLAYERS - room.players.length);
+  const usedNames = new Set(room.players.map(p => p.name));
+  const usedAvatars = new Set(room.players.map(p => p.avatar));
+  for (let i = 0; i < needed; i++) {
+    const name = BOT_NAMES.find(n => !usedNames.has(n)) || `بوت ${i + 1}`;
+    usedNames.add(name);
+    const avatar = BOT_AVATARS.find(a => !usedAvatars.has(a)) || '🤖';
+    usedAvatars.add(avatar);
+    room.players.push({
+      id: makeId('bot'), name, avatar, role: null, alive: true,
+      votedFor: null, isBot: true, lover: false,
     });
   }
-  if (room.state === 'playing') {
-    const win = checkWin(room);
-    if (win) { endGame(room, win); return; }
-  }
-  broadcastRoom(room);
 }
 
-// ══════════════════════════════════════
-//  تدفق اللعبة
-// ══════════════════════════════════════
-function startGame(room) {
+function assignRoles(room) {
   const n = room.players.length;
-  let roles = shuffle(rolesForCount(n)).slice(0, n);
+  const key = Math.min(Math.max(n, 5), 12);
+  let roles = [...(ROLE_DIST[key] || ROLE_DIST[5])];
   while (roles.length < n) roles.push('VILLAGER');
-  roles = shuffle(roles);
-
+  roles = shuffle(roles).slice(0, n);
   room.players.forEach((p, i) => {
     p.role = roles[i];
     p.alive = true;
-    p.protected = false;
-    p.sick = false;
-    p.lover = null;
-    p.elderLives = 1;
     p.votedFor = null;
+    p.lover = false;
   });
+}
 
-  room.state = 'playing';
-  room.day = 1;
-  room.phase = 'night';
-
+function sendRolesToPlayers(room) {
   room.players.forEach(p => {
-    const wolfMates = ROLES[p.role].wolf
-      ? room.players.filter(x => ROLES[x.role].wolf && x.id !== p.id).map(x => x.name)
-      : [];
-    io.to(p.id).emit('game:role', { role: p.role, roleInfo: ROLES[p.role], wolfMates });
+    if (p.isBot) return;
+    const info = roleInfo(p.role);
+    let wolfMates = [];
+    if (info.wolf) {
+      wolfMates = room.players.filter(x => x.id !== p.id && roleInfo(x.role).wolf).map(x => x.name);
+    }
+    io.to(p.id).emit('game:role', { role: p.role, roleInfo: info, wolfMates });
   });
+}
 
-  broadcastRoom(room);
-  setTimeout(() => { if (room.state === 'playing') startNight(room); }, 4000);
+function nightActingOrder(room) {
+  // ترتيب منطقي: كيوبيد (ليلة 1 فقط) → حارس → ذئاب → عرّافة → ساحرة → طبيب الطاعون
+  const order = [];
+  if (room.day === 1) order.push('CUPID');
+  order.push('BODYGUARD', 'WEREWOLF', 'SEER', 'WITCH', 'PLAGUE_DR');
+  const seen = new Set();
+  const result = [];
+  order.forEach(role => {
+    if (seen.has(role)) return;
+    seen.add(role);
+    const holders = alivePlayers(room).filter(p => p.role === role || (role === 'WEREWOLF' && roleInfo(p.role).wolf));
+    if (holders.length) result.push(role);
+  });
+  return result;
 }
 
 function startNight(room) {
   room.phase = 'night';
-  room.nightKill = null;
-  room.nightGuard = null;
-  room.witchSaved = false;
-  room.witchPoisonTarget = null;
-  room.seerDone = false;
-  room.guardDone = false;
-  room.wolfDone = false;
-  room.witchDone = false;
-  room.cupidDone = false;
-  room.plagueDone = false;
-  room.plagueTarget = null;
+  room.nightKillTarget = null;
+  room.guardedId = null;
+  room.plagueSickId = null;
+  room.players.forEach(p => { p.votedFor = null; });
+  room.nightQueue = nightActingOrder(room);
+  room.nightIndex = 0;
   room.nightEvents = [];
-  room.players.forEach(p => { p.protected = false; });
-
   io.to(room.code).emit('phase:night', { day: room.day });
-
-  // ترتيب النداءات الليلية
-  requestCupid(room, () => {
-    requestBodyguard(room, () => {
-      requestSeer(room, () => {
-        requestWolves(room, () => {
-          requestWitch(room, () => {
-            requestPlagueDoctor(room, () => {
-              resolveNight(room);
-            });
-          });
-        });
-      });
-    });
-  });
+  broadcastRoom(room);
+  advanceNightStep(room);
 }
 
-function requestCupid(room, next) {
-  if (room.day !== 1) return next();
-  const cupid = alivePlayers(room).find(p => p.role === 'CUPID');
-  if (!cupid) return next();
-  const targets = alivePlayers(room).map(playerPublic);
-  io.to(cupid.id).emit('night:action', { type: 'cupid', targets });
-  room._cupidNext = next;
-  room._cupidRoom = room;
-  waitForAction(room, cupid.id, 'cupid', 25000, next);
+function botAutoNightAction(room, role) {
+  // بوتات كيديرو أكشن عشوائي بسيط باش الليلة توصل للفجر
+  const targets = alivePlayers(room).filter(p => p.role !== role || role !== 'WEREWOLF');
+  if (role === 'WEREWOLF') {
+    const candidates = villagersOf(room);
+    if (candidates.length) room.nightKillTarget = candidates[Math.floor(Math.random() * candidates.length)].id;
+  } else if (role === 'BODYGUARD') {
+    const candidates = alivePlayers(room);
+    if (candidates.length) room.guardedId = candidates[Math.floor(Math.random() * candidates.length)].id;
+  } else if (role === 'PLAGUE_DR') {
+    const candidates = alivePlayers(room);
+    if (candidates.length && Math.random() > 0.5) room.plagueSickId = candidates[Math.floor(Math.random() * candidates.length)].id;
+  }
+  // السحرة والعرّافة والكيوبيد للبوتات: تخطي بسيط (ما كيأثرش سلباً على التوازن)
 }
 
-function requestBodyguard(room, next) {
-  const bg = alivePlayers(room).find(p => p.role === 'BODYGUARD');
-  if (!bg) return next();
-  const targets = alivePlayers(room).map(playerPublic);
-  io.to(bg.id).emit('night:action', { type: 'bodyguard', targets });
-  waitForAction(room, bg.id, 'bodyguard', 20000, next);
-}
-
-function requestSeer(room, next) {
-  const seer = alivePlayers(room).find(p => p.role === 'SEER');
-  if (!seer) return next();
-  const targets = alivePlayers(room).filter(p => p.id !== seer.id).map(playerPublic);
-  io.to(seer.id).emit('night:action', { type: 'seer_check', targets });
-  waitForAction(room, seer.id, 'seer_check', 20000, next);
-}
-
-function requestWolves(room, next) {
-  const wolves = aliveWolves(room);
-  if (!wolves.length) return next();
-  const targets = alivePlayers(room).filter(p => !ROLES[p.role].wolf).map(playerPublic);
-  wolves.forEach(w => io.to(w.id).emit('night:action', { type: 'wolf_kill', targets }));
-  waitForGroupAction(room, wolves.map(w => w.id), 'wolf_kill', 25000, next);
-}
-
-function requestWitch(room, next) {
-  const witch = alivePlayers(room).find(p => p.role === 'WITCH');
-  if (!witch) return next();
-  const killTarget = room.nightKill ? room.players.find(p => p.id === room.nightKill) : null;
-  const killTargets = alivePlayers(room).filter(p => p.id !== witch.id).map(playerPublic);
-  io.to(witch.id).emit('night:action', {
-    type: 'witch',
-    killTarget: killTarget ? playerPublic(killTarget) : null,
-    canHeal: room.witchHeal && !!room.nightKill,
-    canKill: room.witchKill,
-    killTargets,
-  });
-  waitForAction(room, witch.id, 'witch', 25000, next);
-}
-
-function requestPlagueDoctor(room, next) {
-  const dr = alivePlayers(room).find(p => p.role === 'PLAGUE_DR');
-  if (!dr) return next();
-  const targets = alivePlayers(room).filter(p => p.id !== dr.id).map(playerPublic);
-  io.to(dr.id).emit('night:action', { type: 'plague_dr', targets });
-  waitForAction(room, dr.id, 'plague_dr', 20000, next);
-}
-
-// ── انتظار أفعال الليل ──
-const pendingActions = new Map(); // socketId -> { type, resolve }
-
-function waitForAction(room, socketId, type, timeoutMs, next) {
-  let resolved = false;
-  const timer = setTimeout(() => {
-    if (resolved) return;
-    resolved = true;
-    pendingActions.delete(socketId);
-    next();
-  }, timeoutMs);
-
-  pendingActions.set(socketId, {
-    type,
-    room,
-    resolve: () => {
-      if (resolved) return;
-      resolved = true;
-      clearTimeout(timer);
-      pendingActions.delete(socketId);
-      next();
-    },
-  });
-}
-
-function waitForGroupAction(room, socketIds, type, timeoutMs, next) {
-  let remaining = new Set(socketIds);
-  let resolved = false;
-  const finish = () => {
-    if (resolved) return;
-    resolved = true;
-    clearTimeout(timer);
-    socketIds.forEach(id => pendingActions.delete(id));
-    next();
-  };
-  const timer = setTimeout(finish, timeoutMs);
-
-  socketIds.forEach(id => {
-    pendingActions.set(id, {
-      type,
-      room,
-      resolve: () => {
-        remaining.delete(id);
-        pendingActions.delete(id);
-        if (remaining.size === 0) finish();
-      },
-    });
-  });
-}
-
-function killPlayer(room, player, reason) {
-  if (!player || !player.alive) return;
-  if (player.role === 'ELDER' && player.elderLives > 0) {
-    player.elderLives--;
-    room.nightEvents.push(`🛡️ ${player.name} نجا من الهجوم (شيخ القرية)!`);
+function advanceNightStep(room) {
+  if (room.nightIndex >= room.nightQueue.length) {
+    resolveNight(room);
     return;
   }
-  player.alive = false;
-  room.nightEvents.push(`💀 ${player.name} (${ROLES[player.role].name}) وُجد ميتاً — ${reason}`);
-  io.to(player.id).emit('player:died', { reason });
+  const role = room.nightQueue[room.nightIndex];
+  const holders = alivePlayers(room).filter(p => p.role === role || (role === 'WEREWOLF' && roleInfo(p.role).wolf));
+  const humanHolders = holders.filter(p => !p.isBot);
+  const botHolders = holders.filter(p => p.isBot);
 
-  if (player.lover) {
-    const lover = room.players.find(p => p.id === player.lover);
-    if (lover && lover.alive) {
-      lover.alive = false;
-      room.nightEvents.push(`💔 ${lover.name} مات حزناً على حبيبه!`);
-      io.to(lover.id).emit('player:died', { reason: 'مات حزناً على حبيبه' });
+  botHolders.forEach(() => botAutoNightAction(room, role));
+
+  if (humanHolders.length === 0) {
+    room.nightIndex++;
+    advanceNightStep(room);
+    return;
+  }
+
+  humanHolders.forEach(p => {
+    if (role === 'WEREWOLF') {
+      const targets = villagersOf(room).map(publicPlayer);
+      io.to(p.id).emit('night:action', { type: 'wolf_kill', targets });
+    } else if (role === 'SEER') {
+      const targets = alivePlayers(room).filter(x => x.id !== p.id).map(publicPlayer);
+      io.to(p.id).emit('night:action', { type: 'seer_check', targets });
+    } else if (role === 'WITCH') {
+      const dead = room.nightKillTarget ? room.players.find(x => x.id === room.nightKillTarget) : null;
+      io.to(p.id).emit('night:action', {
+        type: 'witch',
+        killTarget: dead ? publicPlayer(dead) : null,
+        canHeal: room.witchHeal && !!room.nightKillTarget,
+        canKill: room.witchKill,
+        killTargets: alivePlayers(room).filter(x => x.id !== p.id).map(publicPlayer),
+      });
+    } else if (role === 'BODYGUARD') {
+      const targets = alivePlayers(room).map(publicPlayer);
+      io.to(p.id).emit('night:action', { type: 'bodyguard', targets });
+    } else if (role === 'CUPID') {
+      const targets = alivePlayers(room).map(publicPlayer);
+      io.to(p.id).emit('night:action', { type: 'cupid', targets });
+    } else if (role === 'PLAGUE_DR') {
+      const targets = alivePlayers(room).filter(x => x.id !== p.id).map(publicPlayer);
+      io.to(p.id).emit('night:action', { type: 'plague_dr', targets });
     }
-  }
+  });
 
-  if (player.role === 'HUNTER') {
-    triggerHunterShot(room, player);
-  }
-}
-
-function triggerHunterShot(room, hunter) {
-  const targets = alivePlayers(room).filter(p => p.id !== hunter.id).map(playerPublic);
-  if (!targets.length) return;
-  io.to(hunter.id).emit('hunter:shot', { targets });
-  waitForAction(room, hunter.id, 'hunter_shot', 20000, () => {});
+  // بوتات باقيين فأدوار أخرى فحال ماكانش بشر فهاد الدور، صافي — كيتسناو submit ديال البشر
+  room._pendingRole = role;
+  room._pendingHumans = new Set(humanHolders.map(p => p.id));
 }
 
 function resolveNight(room) {
-  // تنفيذ هجوم الذئاب مع الحماية والترياق
-  if (room.nightKill) {
-    const target = room.players.find(p => p.id === room.nightKill);
-    if (target && target.alive) {
-      const guarded = target.protected;
-      const healed = room.witchSaved;
-      if (guarded) {
-        room.nightEvents.push(`🛡️ ${target.name} نجا بفضل الحارس!`);
-      } else if (healed) {
-        room.nightEvents.push(`🧪 الساحرة أنقذت ${target.name} بالترياق!`);
+  const events = [];
+  const wolfTarget = room.nightKillTarget;
+
+  if (wolfTarget) {
+    let blocked = false;
+    if (room.guardedId === wolfTarget) { blocked = true; events.push('🛡️ الحارس أنقذ ضحية الذئاب الليلة!'); }
+    if (room.witchHealUsedOnTarget === wolfTarget) blocked = true;
+    const target = room.players.find(p => p.id === wolfTarget);
+    if (target && target.alive && !blocked) {
+      if (target.role === 'ELDER' && !target._elderHitOnce) {
+        target._elderHitOnce = true;
+        events.push(`👴 ${target.name} (شيخ القرية) صمد أمام هجوم الذئاب!`);
       } else {
-        killPlayer(room, target, 'هجوم الذئاب');
+        target.alive = false;
+        events.push(`💀 وُجد ${target.name} (${roleInfo(target.role).name}) ميتاً عند الفجر!`);
+        killLoverIfNeeded(room, target, events);
+        if (target.role === 'HUNTER') notifyHunter(room, target);
       }
     }
   }
 
-  // تنفيذ سم الساحرة
-  if (room.witchPoisonTarget) {
-    const t = room.players.find(p => p.id === room.witchPoisonTarget);
-    if (t && t.alive) killPlayer(room, t, 'سم الساحرة');
-  }
-
-  // مرض طبيب الطاعون (يُعدم تلقائياً في الفجر التالي لو لم يُشفَ — هنا نبسّطها كقتل مباشر خفيف الاحتمال)
-  if (room.plagueTarget) {
-    const t = room.players.find(p => p.id === room.plagueTarget);
+  if (room._witchPoisonTarget) {
+    const t = room.players.find(p => p.id === room._witchPoisonTarget);
     if (t && t.alive) {
-      t.sick = true;
-      room.nightEvents.push(`⚗️ ${t.name} أُصيب بالطاعون!`);
+      t.alive = false;
+      events.push(`☠️ الساحرة سمّت ${t.name}!`);
+      killLoverIfNeeded(room, t, events);
+      if (t.role === 'HUNTER') notifyHunter(room, t);
     }
+    room._witchPoisonTarget = null;
   }
 
-  room.nightKill = null;
-  room.witchPoisonTarget = null;
+  if (!events.length) events.push('🌙 ليلة هادئة، لم يمت أحد.');
+
+  room.nightEvents = events;
+  io.to(room.code).emit('phase:dawn', { events, day: room.day });
 
   const win = checkWin(room);
-  if (win) { announceDawn(room, () => endGame(room, win)); return; }
+  broadcastRoom(room);
+  if (win) { endGame(room, win); return; }
 
-  announceDawn(room, () => startDay(room));
+  setTimeout(() => startDay(room), 4000);
 }
 
-function announceDawn(room, next) {
-  io.to(room.code).emit('phase:dawn', { events: room.nightEvents, day: room.day });
-  setTimeout(next, 6000);
+function killLoverIfNeeded(room, deadPlayer, events) {
+  if (!room.lovers) return;
+  if (!room.lovers.includes(deadPlayer.id)) return;
+  const otherId = room.lovers.find(id => id !== deadPlayer.id);
+  const other = room.players.find(p => p.id === otherId);
+  if (other && other.alive) {
+    other.alive = false;
+    events.push(`💔 ${other.name} مات حزناً على حبيبه!`);
+  }
+}
+
+function notifyHunter(room, hunter) {
+  if (hunter.isBot) return;
+  const targets = alivePlayers(room).filter(p => p.id !== hunter.id).map(publicPlayer);
+  if (targets.length) io.to(hunter.id).emit('hunter:shot', { targets });
 }
 
 function startDay(room) {
@@ -520,106 +360,130 @@ function startDay(room) {
   room.players.forEach(p => { p.votedFor = null; });
   io.to(room.code).emit('phase:day', { day: room.day });
   broadcastRoom(room);
-
-  setTimeout(() => {
-    if (room.state !== 'playing' || room.phase !== 'day') return;
-    openVote(room);
-  }, 45000);
+  setTimeout(() => openVote(room), 45000);
 }
 
 function openVote(room) {
-  room.votingOpen = true;
-  const candidates = alivePlayers(room).map(playerPublic);
-  io.to(room.code).emit('vote:open', { candidates });
-
-  room.voteTimeout = setTimeout(() => tallyVotes(room), 30000);
+  if (room.state !== 'playing') return;
+  const candidates = alivePlayers(room).map(publicPlayer);
+  alivePlayers(room).filter(p => !p.isBot).forEach(p => {
+    io.to(p.id).emit('vote:open', { candidates: candidates.filter(c => c.id !== p.id) });
+  });
+  // بوتات كيصوتو عشوائياً
+  alivePlayers(room).filter(p => p.isBot).forEach(p => {
+    const options = alivePlayers(room).filter(x => x.id !== p.id);
+    if (options.length) p.votedFor = options[Math.floor(Math.random() * options.length)].id;
+  });
+  checkVotesComplete(room);
 }
 
-function tallyVotes(room) {
-  if (!room.votingOpen) return;
-  room.votingOpen = false;
-  if (room.voteTimeout) { clearTimeout(room.voteTimeout); room.voteTimeout = null; }
-
+function checkVotesComplete(room) {
   const alive = alivePlayers(room);
+  const voted = alive.filter(p => p.votedFor);
+  io.to(room.code).emit('vote:update', { count: voted.length, total: alive.length });
+  if (voted.length < alive.length) return;
+
   const tally = {};
-  alive.forEach(p => { if (p.votedFor) tally[p.votedFor] = (tally[p.votedFor] || 0) + 1; });
-
+  voted.forEach(p => { tally[p.votedFor] = (tally[p.votedFor] || 0) + 1; });
+  const sorted = Object.entries(tally).sort((a, b) => b[1] - a[1]);
   io.to(room.code).emit('vote:result', { tally });
+  if (!sorted.length) { setTimeout(() => startNight2(room), 2000); return; }
 
-  const entries = Object.entries(tally);
-  if (entries.length) {
-    entries.sort((a, b) => b[1] - a[1]);
-    const [maxId, maxCount] = entries[0];
-    const tiedTop = entries.filter(([, c]) => c === maxCount);
-    if (tiedTop.length === 1) {
-      const condemned = room.players.find(p => p.id === maxId);
-      if (condemned && condemned.alive) {
-        const wasFool = condemned.role === 'FOOL';
-        killPlayer(room, condemned, 'حُكم عليه بالإعدام');
-        io.to(room.code).emit('vote:condemned', { player: playerFull(condemned) });
-        if (wasFool) { endGame(room, 'fool'); return; }
-      }
-    }
+  const [condemnedId] = sorted[0];
+  const condemned = room.players.find(p => p.id === condemnedId);
+  if (condemned && condemned.alive) {
+    condemned.alive = false;
+    io.to(room.code).emit('vote:condemned', { player: { ...publicPlayer(condemned), roleInfo: roleInfo(condemned.role) } });
+    if (condemned.role === 'HUNTER') notifyHunter(room, condemned);
+    const evts = [];
+    killLoverIfNeeded(room, condemned, evts);
+    if (evts.length) io.to(room.code).emit('phase:dawn', { events: evts, day: room.day });
   }
-
+  broadcastRoom(room);
   const win = checkWin(room);
   if (win) { endGame(room, win); return; }
-
-  room.day++;
-  setTimeout(() => { if (room.state === 'playing') startNight(room); }, 4000);
+  setTimeout(() => startNight2(room), 3000);
 }
 
-// ══════════════════════════════════════
-//  اتصالات Socket.IO
-// ══════════════════════════════════════
-io.on('connection', (socket) => {
-  console.log(`✅ متصل: ${socket.id}`);
-  socketMeta.set(socket.id, { events: [], warnings: 0 });
+function startNight2(room) {
+  room.day++;
+  startNight(room);
+}
 
-  socket.use((packet, next) => {
-    const [eventName] = packet;
-    if (checkRateLimit(socket, eventName)) next();
+function checkWin(room) {
+  const wolves = wolvesOf(room);
+  const villagers = villagersOf(room);
+  if (!wolves.length) return 'village';
+  if (wolves.length >= villagers.length) return 'wolves';
+  return null;
+}
+
+function endGame(room, winner) {
+  room.state = 'ended';
+  io.to(room.code).emit('game:end', {
+    winner,
+    players: room.players.map(p => ({ ...publicPlayer(p), role: p.role, roleInfo: roleInfo(p.role) })),
   });
+}
+
+/* ------------------------------------------------------------
+   Socket handlers
+   ------------------------------------------------------------ */
+io.on('connection', (socket) => {
+  const ip = getClientIP(socket);
+  if (isBannedIP(ip)) {
+    socket.emit('room:error', 'أنت محظور من هاد اللعبة');
+    socket.disconnect(true);
+    return;
+  }
+
+  console.log(`✅ متصل: ${socket.id} (${ip})`);
 
   socket.on('room:create', ({ playerName }) => {
-    const name = (playerName || 'مضيف').toString().slice(0, 24).trim() || 'مضيف';
-    const code = makeRoomCode();
-    const room = newRoom(code, socket.id);
+    const room = newRoom(socket.id);
     room.players.push({
-      id: socket.id, name, avatar: AVATARS[Math.floor(Math.random() * AVATARS.length)],
-      role: null, alive: true, protected: false, sick: false, lover: null, elderLives: 1, votedFor: null,
+      id: socket.id, name: (playerName || 'مضيف').slice(0, 20), avatar: '🧑',
+      role: null, alive: true, votedFor: null, isBot: false, lover: false,
     });
-    rooms.set(code, room);
-    socket.join(code);
-    socket.emit('room:created', { code });
+    rooms.set(room.code, room);
+    socket.join(room.code);
+    socket.emit('room:created', { code: room.code });
     broadcastRoom(room);
   });
 
   socket.on('room:join', ({ code, playerName }) => {
-    code = (code || '').toString().toUpperCase().trim();
-    const room = rooms.get(code);
-    if (!room) { socket.emit('room:error', 'كود الغرفة غير صحيح'); return; }
+    const room = rooms.get((code || '').toUpperCase());
+    if (!room) { socket.emit('room:error', 'الغرفة غير موجودة'); return; }
     if (room.state !== 'lobby') { socket.emit('room:error', 'اللعبة بدأت بالفعل'); return; }
-    if (room.players.length >= 16) { socket.emit('room:error', 'الغرفة ممتلئة'); return; }
-    if (room.players.some(p => p.id === socket.id)) return;
-
-    const name = (playerName || 'لاعب').toString().slice(0, 24).trim() || 'لاعب';
+    if (room.players.length >= 12) { socket.emit('room:error', 'الغرفة ممتلئة'); return; }
     room.players.push({
-      id: socket.id, name, avatar: AVATARS[Math.floor(Math.random() * AVATARS.length)],
-      role: null, alive: true, protected: false, sick: false, lover: null, elderLives: 1, votedFor: null,
+      id: socket.id, name: (playerName || 'لاعب').slice(0, 20), avatar: '🧑',
+      role: null, alive: true, votedFor: null, isBot: false, lover: false,
     });
-    socket.join(code);
-    socket.emit('room:joined', { code });
+    socket.join(room.code);
+    socket.emit('room:joined', { code: room.code });
     broadcastRoom(room);
   });
 
   socket.on('game:start', () => {
     const room = findRoomBySocket(socket.id);
-    if (!room) return;
-    if (room.host !== socket.id) { socket.emit('room:error', 'فقط المضيف يمكنه بدء اللعبة'); return; }
-    if (room.state !== 'lobby') return;
-    if (room.players.length < 5) { socket.emit('room:error', 'يجب 5 لاعبين على الأقل'); return; }
-    startGame(room);
+    if (!room || room.hostId !== socket.id) return;
+    if (room.players.filter(p => !p.isBot).length < 2) {
+      socket.emit('room:error', 'خاصك لاعب آخر واحد على الأقل باش تبدا');
+      return;
+    }
+    addBotsToRoom(room);
+    if (room.players.length < MIN_PLAYERS) {
+      socket.emit('room:error', `خاص ${MIN_PLAYERS} لاعبين على الأقل`);
+      return;
+    }
+    assignRoles(room);
+    room.state = 'playing';
+    room.day = 1;
+    room.lovers = null;
+    broadcastRoom(room);
+    sendRolesToPlayers(room);
+    setTimeout(() => startNight(room), 5000);
   });
 
   socket.on('night:submit', (data) => {
@@ -627,131 +491,224 @@ io.on('connection', (socket) => {
     if (!room || room.state !== 'playing' || room.phase !== 'night') return;
     const player = room.players.find(p => p.id === socket.id);
     if (!player || !player.alive) return;
+    const role = room._pendingRole;
+    if (!role) return;
 
-    const pending = pendingActions.get(socket.id);
-    if (!pending || pending.room !== room) return;
-
-    switch (data.type) {
-      case 'cupid': {
-        if (pending.type !== 'cupid') return;
-        const p1 = room.players.find(p => p.id === data.lover1);
-        const p2 = room.players.find(p => p.id === data.lover2);
-        if (p1 && p2 && p1.id !== p2.id) {
-          p1.lover = p2.id; p2.lover = p1.id;
-          room.nightEvents.push(`💘 كيوبيد ربط ${p1.name} و ${p2.name}!`);
-        }
-        break;
+    if (data.type === 'wolf_kill' && roleInfo(player.role).wolf) {
+      if (data.targetId) room.nightKillTarget = data.targetId;
+    } else if (data.type === 'seer_check' && player.role === 'SEER') {
+      const t = room.players.find(x => x.id === data.targetId);
+      if (t) socket.emit('seer:result', { targetName: t.name, role: t.role, roleInfo: roleInfo(t.role) });
+    } else if (data.type === 'witch' && player.role === 'WITCH') {
+      if (data.heal && room.witchHeal && room.nightKillTarget) {
+        room.witchHeal = false;
+        room.witchHealUsedOnTarget = room.nightKillTarget;
+        room.nightKillTarget = null;
+      } else if (data.killTargetId && room.witchKill) {
+        room.witchKill = false;
+        room._witchPoisonTarget = data.killTargetId;
       }
-      case 'bodyguard': {
-        if (pending.type !== 'bodyguard') return;
-        if (data.targetId) {
-          const t = room.players.find(p => p.id === data.targetId);
-          if (t) { t.protected = true; room.nightGuard = t.id; }
-        }
-        break;
+    } else if (data.type === 'bodyguard' && player.role === 'BODYGUARD') {
+      room.guardedId = data.targetId || null;
+    } else if (data.type === 'cupid' && player.role === 'CUPID') {
+      if (data.lover1 && data.lover2) {
+        room.lovers = [data.lover1, data.lover2];
+        [data.lover1, data.lover2].forEach(id => {
+          const p = room.players.find(x => x.id === id);
+          if (p) p.lover = true;
+        });
       }
-      case 'seer_check': {
-        if (pending.type !== 'seer_check') return;
-        if (data.targetId) {
-          const t = room.players.find(p => p.id === data.targetId);
-          if (t) {
-            socket.emit('seer:result', { targetName: t.name, role: t.role, roleInfo: ROLES[t.role] });
-          }
-        }
-        break;
-      }
-      case 'wolf_kill': {
-        if (pending.type !== 'wolf_kill') return;
-        if (data.targetId) room.nightKill = data.targetId;
-        break;
-      }
-      case 'witch': {
-        if (pending.type !== 'witch') return;
-        if (data.heal && room.witchHeal && room.nightKill) {
-          room.witchHeal = false;
-          room.witchSaved = true;
-          room.nightEvents.push('🧪 الساحرة استخدمت الترياق!');
-        } else if (data.killTargetId && room.witchKill) {
-          room.witchKill = false;
-          room.witchPoisonTarget = data.killTargetId;
-        }
-        break;
-      }
-      case 'plague_dr': {
-        if (pending.type !== 'plague_dr') return;
-        if (data.targetId) room.plagueTarget = data.targetId;
-        break;
-      }
-      default:
-        return;
+    } else if (data.type === 'plague_dr' && player.role === 'PLAGUE_DR') {
+      room.plagueSickId = data.targetId || null;
     }
-    pending.resolve();
+
+    if (room._pendingHumans) {
+      room._pendingHumans.delete(socket.id);
+      if (room._pendingHumans.size === 0) {
+        room.nightIndex++;
+        advanceNightStep(room);
+      }
+    }
+  });
+
+  socket.on('vote:submit', ({ targetId }) => {
+    const room = findRoomBySocket(socket.id);
+    if (!room || room.state !== 'playing' || room.phase !== 'day') return;
+    const player = room.players.find(p => p.id === socket.id);
+    if (!player || !player.alive) return;
+    player.votedFor = targetId || null;
+    checkVotesComplete(room);
   });
 
   socket.on('hunter:submit', ({ targetId }) => {
     const room = findRoomBySocket(socket.id);
     if (!room) return;
-    const pending = pendingActions.get(socket.id);
-    if (!pending || pending.type !== 'hunter_shot' || pending.room !== room) return;
-    const target = room.players.find(p => p.id === targetId);
-    if (target && target.alive) {
-      killPlayer(room, target, 'سهم الصيّاد الأخير');
-      const win = checkWin(room);
-      if (win) { pending.resolve(); endGame(room, win); return; }
-    }
-    pending.resolve();
-  });
-
-  socket.on('vote:submit', ({ targetId }) => {
-    const room = findRoomBySocket(socket.id);
-    if (!room || room.state !== 'playing' || room.phase !== 'day' || !room.votingOpen) return;
-    const player = room.players.find(p => p.id === socket.id);
-    if (!player || !player.alive) return;
-    const target = room.players.find(p => p.id === targetId);
-    if (!target || !target.alive) return;
-
-    player.votedFor = targetId;
-    const alive = alivePlayers(room);
-    const votedCount = alive.filter(p => p.votedFor).length;
-    io.to(room.code).emit('vote:update', { count: votedCount, total: alive.length });
-
-    if (votedCount === alive.length) {
-      tallyVotes(room);
-    }
+    const t = room.players.find(p => p.id === targetId);
+    if (!t || !t.alive) return;
+    t.alive = false;
+    const evts = [`🏹 الصيّاد أطلق سهمه على ${t.name}!`];
+    killLoverIfNeeded(room, t, evts);
+    io.to(room.code).emit('phase:dawn', { events: evts, day: room.day });
+    broadcastRoom(room);
+    const win = checkWin(room);
+    if (win) endGame(room, win);
   });
 
   socket.on('chat:send', ({ text }) => {
     const room = findRoomBySocket(socket.id);
     if (!room) return;
     const player = room.players.find(p => p.id === socket.id);
-    if (!player) return;
-    if (room.state === 'playing' && !player.alive) return;
-    if (typeof text !== 'string' || !text.trim()) return;
-    if (text.length > 300) { socket.emit('room:error', 'الرسالة طويلة جداً!'); return; }
-    if (containsExternalContact(text)) {
-      socket.emit('room:error', 'لا يُسمح بمشاركة روابط أو حسابات تواصل اجتماعي بالدردشة.');
-      return;
-    }
-    text = filterProfanity(text.trim());
-
-    const isWolfChat = room.state === 'playing' && room.phase === 'night' && ROLES[player.role]?.wolf;
-    const msg = {
-      sender: player.name, avatar: player.avatar, text,
-      isWolfOnly: !!isWolfChat, color: isWolfChat ? '#e74c3c' : '#ecf0f1',
-    };
+    if (!player || !player.alive) return;
+    if (!text || !String(text).trim()) return;
+    const isWolfChat = room.phase === 'night' && roleInfo(player.role).wolf;
+    const msg = { sender: player.name, avatar: player.avatar, text: String(text).slice(0, 300), isWolfOnly: isWolfChat };
     if (isWolfChat) {
-      aliveWolves(room).forEach(w => io.to(w.id).emit('chat:message', msg));
+      wolvesOf(room).filter(w => !w.isBot).forEach(w => io.to(w.id).emit('chat:message', msg));
     } else {
       io.to(room.code).emit('chat:message', msg);
     }
   });
 
+  /* ---------------- Creator auth & tools ---------------- */
+
+  socket.on('creator:auth', (code) => {
+    if (!CREATOR_SECRET) {
+      socket.emit('creator:error', 'ميزة المطور غير مفعّلة على هاد السيرفر');
+      return;
+    }
+    if (code === CREATOR_SECRET) {
+      creatorSockets.add(socket.id);
+      const room = findRoomBySocket(socket.id);
+      socket.emit('creator:ok', { name: 'Alaa Dev' });
+      console.log(`👑 Creator authenticated: ${socket.id} (${ip})`);
+      if (room) broadcastRoom(room);
+    } else {
+      socket.emit('creator:error', 'الكود غير صحيح');
+    }
+  });
+
+  socket.on('creator:addBots', ({ count }) => {
+    requireCreator(socket, () => {
+      const room = findRoomBySocket(socket.id);
+      if (!room) return;
+      const n = Math.max(1, Math.min(parseInt(count, 10) || 1, 10));
+      const usedNames = new Set(room.players.map(p => p.name));
+      const usedAvatars = new Set(room.players.map(p => p.avatar));
+      for (let i = 0; i < n; i++) {
+        const name = BOT_NAMES.find(nm => !usedNames.has(nm)) || `بوت ${Date.now()}${i}`;
+        usedNames.add(name);
+        const avatar = BOT_AVATARS.find(a => !usedAvatars.has(a)) || '🤖';
+        usedAvatars.add(avatar);
+        room.players.push({ id: makeId('bot'), name, avatar, role: 'VILLAGER', alive: true, votedFor: null, isBot: true, lover: false });
+      }
+      broadcastRoom(room);
+    });
+  });
+
+  socket.on('creator:kick', (targetId) => {
+    requireCreator(socket, () => {
+      const room = findRoomBySocket(socket.id);
+      if (!room) return;
+      const idx = room.players.findIndex(p => p.id === targetId);
+      if (idx === -1) return;
+      const kicked = room.players[idx];
+      io.to(targetId).emit('room:error', 'تم طردك من قِبل المطور');
+      room.players.splice(idx, 1);
+      broadcastRoom(room);
+    });
+  });
+
+  // حظر: type = 'session' (يقدر يرجع يدخل من بعد) أو 'permanent' (حتى يتعاود تشغيل السيرفر)
+  socket.on('creator:ban', ({ targetId, type }) => {
+    requireCreator(socket, () => {
+      const room = findRoomBySocket(socket.id);
+      if (!room) return;
+      const idx = room.players.findIndex(p => p.id === targetId);
+      if (idx === -1) return;
+      const target = room.players[idx];
+      const targetSocket = io.sockets.sockets.get(targetId);
+      const targetIP = targetSocket ? getClientIP(targetSocket) : null;
+      if (targetIP) {
+        if (type === 'permanent') permBannedIPs.add(targetIP);
+        else sessionBannedIPs.add(targetIP);
+      }
+      io.to(targetId).emit('room:error', type === 'permanent' ? 'تم حظرك بشكل دائم' : 'تم حظرك من قِبل المطور');
+      if (targetSocket) targetSocket.disconnect(true);
+      room.players.splice(idx, 1);
+      broadcastRoom(room);
+    });
+  });
+
+  socket.on('creator:unban', (ip) => {
+    requireCreator(socket, () => {
+      permBannedIPs.delete(ip);
+      sessionBannedIPs.delete(ip);
+      socket.emit('creator:banList', { permanent: [...permBannedIPs], session: [...sessionBannedIPs] });
+    });
+  });
+
+  socket.on('creator:getBanList', () => {
+    requireCreator(socket, () => {
+      socket.emit('creator:banList', { permanent: [...permBannedIPs], session: [...sessionBannedIPs] });
+    });
+  });
+
+  socket.on('creator:setRole', ({ targetId, role }) => {
+    requireCreator(socket, () => {
+      const room = findRoomBySocket(socket.id);
+      if (!room || !ROLES_INFO[role]) return;
+      const p = room.players.find(x => x.id === targetId);
+      if (!p) return;
+      p.role = role;
+      if (!p.isBot) io.to(p.id).emit('game:role', { role: p.role, roleInfo: roleInfo(p.role), wolfMates: [] });
+      broadcastRoom(room);
+    });
+  });
+
+  socket.on('creator:setPhase', (phase) => {
+    requireCreator(socket, () => {
+      const room = findRoomBySocket(socket.id);
+      if (!room) return;
+      if (phase === 'night') startNight(room);
+      else if (phase === 'day') startDay(room);
+    });
+  });
+
+  socket.on('creator:forceEnd', (winner) => {
+    requireCreator(socket, () => {
+      const room = findRoomBySocket(socket.id);
+      if (!room) return;
+      endGame(room, winner === 'wolves' ? 'wolves' : 'village');
+    });
+  });
+
+  socket.on('creator:restart', () => {
+    requireCreator(socket, () => {
+      const room = findRoomBySocket(socket.id);
+      if (!room) return;
+      room.state = 'lobby'; room.phase = 'night'; room.day = 1;
+      room.players.forEach(p => { p.role = null; p.alive = true; p.votedFor = null; p.lover = false; });
+      broadcastRoom(room);
+    });
+  });
+
   socket.on('disconnect', () => {
-    socketMeta.delete(socket.id);
-    pendingActions.delete(socket.id);
+    creatorSockets.delete(socket.id);
     const room = findRoomBySocket(socket.id);
-    if (room) removePlayerFromRoom(room, socket.id, false);
-    console.log(`❌ غادر: ${socket.id}`);
+    if (!room) return;
+    const idx = room.players.findIndex(p => p.id === socket.id);
+    if (idx === -1) return;
+    const left = room.players[idx];
+    room.players.splice(idx, 1);
+    console.log(`❌ ${left.name} غادر الغرفة ${room.code}`);
+    if (room.players.length === 0) {
+      rooms.delete(room.code);
+      return;
+    }
+    if (room.hostId === socket.id) {
+      room.hostId = room.players[0].id;
+    }
+    broadcastRoom(room);
   });
 });
 
