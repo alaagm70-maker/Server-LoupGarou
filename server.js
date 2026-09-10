@@ -2,7 +2,7 @@
    Loup Garou — server.js
    يطابق البروتوكول اللي كيستعملو olders.html (room:*, game:*, night:*, vote:*, chat:*)
    + نظام Creator آمن (السر فالسيرفر فقط، عبر متغير بيئة)
-   ========================================================= */
+   =========================================================- */
 const express = require('express');
 const app = express();
 const http = require('http').createServer(app);
