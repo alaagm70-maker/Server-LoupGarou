@@ -1009,7 +1009,11 @@ io.on('connection', (socket) => {
       socket.emit('creator:error', 'محاولات كثيرة، عاود حاول من بعد شوية');
       return;
     }
-    if (typeof code === 'string' && safeCompareSecret(code)) {
+    // بعض الواجهات كتبعث { code: 'xxx' } بدل string مباشرة — نقبلو الحالتين
+    // وكنشيلو أي مسافات زايدة (نسيان trim فحقل الإدخال سبب شائع لـ false negative)
+    let submitted = (code && typeof code === 'object') ? code.code : code;
+    if (typeof submitted === 'string') submitted = submitted.trim();
+    if (typeof submitted === 'string' && safeCompareSecret(submitted)) {
       clearCreatorAuthAttempts(ip);
       creatorSockets.add(socket.id);
       const room = findRoomBySocket(socket.id);
