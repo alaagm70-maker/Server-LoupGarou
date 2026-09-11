@@ -1,8 +1,12 @@
 /* =========================================================
-   Loup Garou — server.js
+   Loup Garou — server.js  (نسخة مصلحة + بوتات فيهم دماغ صغير للدردشة)
    يطابق البروتوكول اللي كيستعملو olders.html (room:*, game:*, night:*, vote:*, chat:*)
    + نظام Creator آمن (السر فالسيرفر فقط، عبر متغير بيئة)
-   =========================================================- */
+   + BotBrain: شبكة عصبية صغيرة (~10K بارامتر) مدمجة، تُستعمل غير باش
+     البوتات "يفكّرو" شنو يقولو فالشات (اختيار النية + الهدف)، ماشي
+     لتوليد نص حر — النصوص نفسها مبنية من بنك جمل جاهزة (توكنات/عبارات)
+     باش تبقى مفهومة ومتماسكة.
+   ========================================================= */
 const express = require('express');
 const app = express();
 const http = require('http').createServer(app);
@@ -14,43 +18,17 @@ app.use(express.static(__dirname));
 
 /* ------------------------------------------------------------
    Creator auth (آمن): السر كيتقارن فالسيرفر فقط.
-   ⚠️ هادشي هو السر الحقيقي ديالك، مكتوب هنا كـ fallback باش
-   يخدم حتى إلا ماكانتش environment variable معرفة.
-   إلا بغيتي تبدلو من متغير بيئة، دير:
+   خاصك تصاوب متغير بيئة قبل التشغيل، مثلاً:
      CREATOR_SECRET=IAM-ALAA-DEVOFLOUPPY node server.js
    ------------------------------------------------------------ */
-const CREATOR_SECRET = process.env.CREATOR_SECRET || 'IAM-ALAA-DEVOFLOUPPY';
-console.log('[creator] CREATOR_SECRET جاهز:', CREATOR_SECRET ? '✅' : '❌ غير معرف!');
+const CREATOR_SECRET = process.env.CREATOR_SECRET || null;
 
-/* ------------------------------------------------------------
-   Creator device-lock: نظام قفل الكود لأول جهاز ينجح بيه
-   ------------------------------------------------------------ */
-const fs = require('fs');
-const path = require('path');
-const STATE_FILE = path.join(__dirname, 'creator-state.json');
-const BANS_FILE  = path.join(__dirname, 'permanent-bans.json');
-
-function loadJSON(file, fallback) {
-  try { return JSON.parse(fs.readFileSync(file, 'utf8')); }
-  catch (e) { return fallback; }
-}
-function saveJSON(file, data) {
-  try { fs.writeFileSync(file, JSON.stringify(data, null, 2)); }
-  catch (e) { console.error('فشل الحفظ:', file, e); }
-}
-
-// { deviceToken: string|null, name: string|null }
-let creatorState = loadJSON(STATE_FILE, { deviceToken: null, name: null });
-// [{ id, name, deviceToken, ip, reason, bannedAt }]
-let permanentBans = loadJSON(BANS_FILE, []);
-
-// socket.id ديال أي واحد أثبت أنه Creator فهاد الجلسة الحالية
+// socket.id ديال أي واحد أثبت أنه Creator فهاد الجلسة الحالية ديال السيرفر
 const creatorSockets = new Set();
-// مرجع للسوكيت الحالي ديال الكرييتور (باش نبعثو ليه إشعارات الاختراق)
-let creatorSocketRef = null;
 
-// IPs محظورة بشكل دائم / مؤقت (session)
-const permBannedIPs = new Set(permanentBans.map(b => b.ip).filter(Boolean));
+// IPs محظورة بشكل دائم (كتضيع لما يعاود يتشغل السيرفر — حسب الطلب)
+const permBannedIPs = new Set();
+// IPs محظورة مؤقتاً لهاد التشغيلة الحالية فقط
 const sessionBannedIPs = new Set();
 
 function getClientIP(socket) {
@@ -61,14 +39,6 @@ function getClientIP(socket) {
 
 function isBannedIP(ip) {
   return permBannedIPs.has(ip) || sessionBannedIPs.has(ip);
-}
-
-function isPermanentlyBannedDevice({ id, deviceToken, ip }) {
-  return permanentBans.some(b =>
-    (deviceToken && b.deviceToken === deviceToken) ||
-    (ip && b.ip === ip) ||
-    (id && b.id === id)
-  );
 }
 
 function isCreator(socket) {
@@ -113,6 +83,7 @@ const ROLE_DIST = {
   12: ['WEREWOLF', 'WEREWOLF', 'ALPHA_WOLF', 'SEER', 'WITCH', 'HUNTER', 'BODYGUARD', 'CUPID', 'FOOL', 'THIEF', 'ELDER', 'PLAGUE_DR'],
 };
 
+const MAX_PLAYERS = 12;
 const MIN_PLAYERS = 5;
 const BOT_NAMES = ['سعيد', 'فاطمة', 'يوسف', 'خديجة', 'رشيد', 'سميرة', 'كريم', 'ليلى', 'عادل', 'نادية', 'حمزة', 'أمينة'];
 const BOT_AVATARS = ['🤖', '👽', '🐺', '🦊', '🐻', '🦁', '🐯', '🐸'];
@@ -120,6 +91,304 @@ const BOT_AVATARS = ['🤖', '👽', '🐺', '🦊', '🐻', '🦁', '🐯', '�
 function shuffle(arr) { return arr.map(v => [Math.random(), v]).sort((a, b) => a[0] - b[0]).map(x => x[1]); }
 function makeId(prefix) { return prefix + '-' + Math.random().toString(36).slice(2, 10); }
 function roleInfo(key) { return ROLES_INFO[key] || ROLES_INFO.VILLAGER; }
+
+/* ------------------------------------------------------------
+   🧠 BotBrain — شبكة عصبية صغيرة (~10K بارامتر) مدمجة فالسيرفر
+   الهدف: غير "التفكير" (شنو ينوي البوت يقول + شكون الهدف)، ماشي
+   توليد نص حر — هادشي كيحافظ على جمل مفهومة ب100% ديال الوقت.
+   ------------------------------------------------------------ */
+function mulberry32(seed) {
+  let s = seed >>> 0;
+  return function () {
+    s |= 0; s = (s + 0x6D2B79F5) | 0;
+    let t = Math.imul(s ^ (s >>> 15), 1 | s);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+function hashStr(str) {
+  let h = 2166136261;
+  for (let i = 0; i < str.length; i++) { h ^= str.charCodeAt(i); h = Math.imul(h, 16777619); }
+  return h >>> 0;
+}
+function randMatrix(rows, cols, rng) {
+  const m = new Array(rows * cols);
+  const scale = Math.sqrt(2 / (rows + cols));
+  for (let i = 0; i < m.length; i++) m[i] = (rng() * 2 - 1) * scale;
+  return m;
+}
+class TinyBrain {
+  // شبكة feed-forward صغيرة: F=16 مدخل → H1=70 → H2=70 → O=50 مخرج
+  // مجموع البارامترات ≈ 9710 (قريب من 10K كيما طلب المستخدم)
+  constructor(seed = 1337) {
+    const rng = mulberry32(seed);
+    this.F = 16; this.H1 = 70; this.H2 = 70; this.O = 50;
+    this.W1 = randMatrix(this.F, this.H1, rng); this.b1 = new Array(this.H1).fill(0);
+    this.W2 = randMatrix(this.H1, this.H2, rng); this.b2 = new Array(this.H2).fill(0);
+    this.W3 = randMatrix(this.H2, this.O, rng); this.b3 = new Array(this.O).fill(0);
+    this.paramCount =
+      this.W1.length + this.b1.length +
+      this.W2.length + this.b2.length +
+      this.W3.length + this.b3.length;
+  }
+  static relu(x) { return x > 0 ? x : 0; }
+  forward(input) {
+    const h1 = new Array(this.H1);
+    for (let j = 0; j < this.H1; j++) {
+      let s = this.b1[j];
+      for (let i = 0; i < this.F; i++) s += input[i] * this.W1[i * this.H1 + j];
+      h1[j] = TinyBrain.relu(s);
+    }
+    const h2 = new Array(this.H2);
+    for (let j = 0; j < this.H2; j++) {
+      let s = this.b2[j];
+      for (let i = 0; i < this.H1; i++) s += h1[i] * this.W2[i * this.H2 + j];
+      h2[j] = TinyBrain.relu(s);
+    }
+    const out = new Array(this.O);
+    for (let j = 0; j < this.O; j++) {
+      let s = this.b3[j];
+      for (let i = 0; i < this.H2; i++) s += h2[i] * this.W3[i * this.O + j];
+      out[j] = s;
+    }
+    return out; // logits خام: [0..11]=نيات, [12..15]=نبرة, [16..49]=اختيار صيغة/توكن
+  }
+}
+const BOT_BRAIN = new TinyBrain(20260911);
+console.log(`🧠 BotBrain جاهز — عدد البارامترات: ${BOT_BRAIN.paramCount}`);
+
+function softmax(arr, temp = 1) {
+  const m = Math.max(...arr);
+  const exps = arr.map(x => Math.exp((x - m) / temp));
+  const sum = exps.reduce((a, b) => a + b, 0) || 1;
+  return exps.map(e => e / sum);
+}
+function sampleIndex(probs, rng = Math.random) {
+  const r = rng(); let acc = 0;
+  for (let i = 0; i < probs.length; i++) { acc += probs[i]; if (r <= acc) return i; }
+  return probs.length - 1;
+}
+
+const INTENTS = [
+  'accuse', 'defend_self', 'defend_other', 'suspicious_general',
+  'support_vote', 'mourn', 'wolf_target_discuss', 'wolf_agree',
+  'calm_villager', 'joke', 'call_for_vote', 'silence_pass',
+];
+const DAY_INTENT_IDX = [0, 1, 2, 3, 4, 5, 8, 9, 10, 11]; // كلشي ما عدا نوايا الذئاب
+const WOLF_INTENT_IDX = [6, 7, 3, 8]; // نوايا خاصة بشات الذئاب
+
+const CHAT_TEMPLATES = {
+  accuse: [
+    'أنا مركز بزاف على {target}، شي حاجة فيه مشبوهة 🤨',
+    '{target} كيهضر بزاف باش يبعد الشك عليه...',
+    'واش حد آخر حس بلي {target} غريب الليلة؟',
+    'أنا نصوت ضد {target}، ما عنديش ثقة فيه',
+  ],
+  defend_self: [
+    'أنا برئ، عافاك ما ديروش الشك علي!',
+    'صافي ثقو فيا، ما عنديش علاقة بالموضوع',
+    'كيفاش تشكو فيا؟ أنا غير فلاح عادي!',
+  ],
+  defend_other: [
+    'خليو {target}، ما شفتش عليه شي حاجة مريبة',
+    'أنا واثق ف{target}، ماشي هوما',
+  ],
+  suspicious_general: [
+    'كاين شي حد فينا كايكذب...',
+    'خاصنا نديرو attention لكل حركة الليلة',
+    'الوضعية صعيبة، خاصنا نفكرو مزيان قبل نصوتو',
+  ],
+  support_vote: [
+    'متافق، نصوتو ضد {target}',
+    'أنا نتبع الجماعة فهاد التصويت',
+  ],
+  mourn: [
+    'الله يرحمو... خسارة كبيرة 😢',
+    'كنا نظن بلي هو بريء...',
+    'الله يرحمو، خاصنا نكونو أذكى من دابا',
+  ],
+  wolf_target_discuss: [
+    'شكون نضربو الليلة؟ أنا نقترح {target}',
+    '{target} خطر علينا، خاصنا نبعدوه',
+    'واش كلكم متافقين على {target}؟',
+  ],
+  wolf_agree: [
+    'متافق، {target} هدف زوين 🐺',
+    'ياك، نمشيو عليه الليلة',
+  ],
+  calm_villager: [
+    'سيري بلا ستريس، غادي نلقاو الذيب',
+    'خاصنا نبقاو متحدين باش نربحو',
+  ],
+  joke: [
+    '😂 حتى أنا بديت نشك ف راسي',
+    'هادي لعبة ولا محكمة؟ 😅',
+  ],
+  call_for_vote: [
+    'واخا نبداو نصوتو؟',
+    'خاصنا نحسمو دابا، الوقت كايمشي',
+  ],
+  silence_pass: ['...', 'مازال كنفكر 🤔'],
+};
+
+// شخصية ثابتة لكل بوت (4 خصائص 0..1) مبنية من hash ديال الاسم — كل بوت عندو "طبع" مختلف
+const personalityCache = new Map();
+function personalityFor(botKey) {
+  if (personalityCache.has(botKey)) return personalityCache.get(botKey);
+  const rng = mulberry32(hashStr(botKey));
+  const p = [rng(), rng(), rng(), rng()]; // [عدوانية, ثرثرة, ثقة, فكاهة]
+  personalityCache.set(botKey, p);
+  return p;
+}
+
+function buildFeatures(room, bot, { isWolfChat = false } = {}) {
+  const alive = alivePlayers(room);
+  const wolves = wolvesOf(room);
+  const accusedCount = (room._suspicion && room._suspicion.get(bot.id)) || 0;
+  const p = personalityFor(bot.id + ':' + bot.name);
+  return [
+    room.phase === 'night' ? 1 : 0,
+    room.phase === 'day' ? 1 : 0,
+    Math.min(room.day / 10, 1),
+    alive.length ? alive.length / room.players.length : 0,
+    roleInfo(bot.role).wolf ? 1 : 0,
+    Math.min(accusedCount / 3, 1),
+    room._justDied ? 1 : 0,
+    alive.length ? wolves.length / alive.length : 0,
+    p[0], p[1], p[2], p[3],
+    Math.random(), Math.random(),
+    isWolfChat ? 1 : 0,
+    1, // bias
+  ];
+}
+
+function pickTarget(room, bot, wolvesOnly) {
+  const pool = alivePlayers(room).filter(x => x.id !== bot.id && (!wolvesOnly || !roleInfo(x.role).wolf));
+  if (!pool.length) return null;
+  // كيفضّل هدف تراكمت عليه شكوك (تخزنة فـ room._suspicion) مع شوية عشوائية
+  const weights = pool.map(p => 1 + ((room._suspicion && room._suspicion.get(p.id)) || 0) * 1.5);
+  const total = weights.reduce((a, b) => a + b, 0);
+  let r = Math.random() * total;
+  for (let i = 0; i < pool.length; i++) { r -= weights[i]; if (r <= 0) return pool[i]; }
+  return pool[pool.length - 1];
+}
+
+function botThink(room, bot, opts = {}) {
+  const isWolfChat = !!opts.isWolfChat;
+  const features = buildFeatures(room, bot, { isWolfChat });
+  const logits = BOT_BRAIN.forward(features);
+  const allowedIdx = isWolfChat ? WOLF_INTENT_IDX : DAY_INTENT_IDX;
+  const masked = INTENTS.map((_, i) => (allowedIdx.includes(i) ? logits[i] : -Infinity));
+  const probs = softmax(masked, 0.85);
+  const intent = INTENTS[sampleIndex(probs)];
+
+  let target = null;
+  if (['accuse', 'defend_other', 'support_vote', 'wolf_target_discuss', 'wolf_agree'].includes(intent)) {
+    target = pickTarget(room, bot, isWolfChat);
+    if (!target) return null;
+  }
+
+  const bank = CHAT_TEMPLATES[intent] || CHAT_TEMPLATES.silence_pass;
+  // اختيار الصيغة باستعمال جزء من مخرجات الشبكة (توكن الاختيار) بدل عشوائية بحتة
+  const variantScore = logits.slice(16, 16 + bank.length);
+  const variantProbs = softmax(variantScore.length ? variantScore : [1], 0.9);
+  const variantIdx = sampleIndex(variantProbs) % bank.length;
+  let text = bank[variantIdx];
+  if (target) text = text.replace('{target}', target.name);
+
+  if (intent === 'accuse' && target) bumpSuspicion(room, target.id);
+
+  return { intent, target, text, isWolfChat };
+}
+
+function bumpSuspicion(room, playerId) {
+  if (!room._suspicion) room._suspicion = new Map();
+  room._suspicion.set(playerId, ((room._suspicion.get(playerId)) || 0) + 1);
+}
+
+function emitBotChat(room, bot, think) {
+  if (!think) return;
+  const msg = { sender: bot.name, avatar: bot.avatar, text: think.text, isWolfOnly: think.isWolfChat, isBot: true };
+  if (think.isWolfChat) {
+    wolvesOf(room).filter(w => !w.isBot).forEach(w => io.to(w.id).emit('chat:message', msg));
+  } else {
+    io.to(room.code).emit('chat:message', msg);
+  }
+}
+
+/* ------------------------------------------------------------
+   تايمرات الغرفة — تتبع كل setTimeout باش نقدرو نمسحوها ونتفاديو
+   تداخل الجولات لما الـ Creator يدير restart/forceEnd أو الغرفة تفرغ
+   ------------------------------------------------------------ */
+function addTimer(room, fn, ms) {
+  const id = setTimeout(() => {
+    room.timers.delete(id);
+    fn();
+  }, ms);
+  room.timers.add(id);
+  return id;
+}
+function clearRoomTimers(room) {
+  room.timers.forEach(id => clearTimeout(id));
+  room.timers.clear();
+}
+
+/* ------------------------------------------------------------
+   جدولة دردشة البوتات
+   ------------------------------------------------------------ */
+function scheduleDayChat(room) {
+  const window = 45000; // نفس مدة نقاش النهار فـ startDay
+  const bots = alivePlayers(room).filter(p => p.isBot);
+  bots.forEach(bot => {
+    const p = personalityFor(bot.id + ':' + bot.name);
+    const msgCount = 1 + Math.round(p[1] * 2); // 1..3 رسائل حسب "الثرثرة"
+    for (let i = 0; i < msgCount; i++) {
+      const delay = 2000 + Math.random() * (window - 4000);
+      addTimer(room, () => {
+        if (room.state !== 'playing' || room.phase !== 'day') return;
+        const fresh = room.players.find(x => x.id === bot.id);
+        if (!fresh || !fresh.alive) return;
+        emitBotChat(room, fresh, botThink(room, fresh));
+      }, delay);
+    }
+  });
+  if (room._justDied) {
+    addTimer(room, () => {
+      if (room.state !== 'playing' || room.phase !== 'day') return;
+      const mourner = alivePlayers(room).find(p => p.isBot);
+      if (mourner) emitBotChat(room, mourner, botThink(room, mourner));
+    }, 1200 + Math.random() * 1500);
+    room._justDied = false;
+  }
+}
+
+function scheduleWolfChat(room) {
+  const wolfBots = wolvesOf(room).filter(w => w.isBot);
+  if (!wolfBots.length) return;
+  const rounds = Math.min(2, wolfBots.length);
+  for (let i = 0; i < rounds; i++) {
+    const speaker = wolfBots[Math.floor(Math.random() * wolfBots.length)];
+    addTimer(room, () => {
+      if (room.state !== 'playing' || room.phase !== 'night') return;
+      const fresh = room.players.find(x => x.id === speaker.id);
+      if (!fresh || !fresh.alive) return;
+      emitBotChat(room, fresh, botThink(room, fresh, { isWolfChat: true }));
+    }, 800 + i * 1800 + Math.random() * 600);
+  }
+}
+
+function scheduleBotDefense(room, accusedBot) {
+  addTimer(room, () => {
+    if (room.state !== 'playing' || room.phase !== 'day') return;
+    const fresh = room.players.find(x => x.id === accusedBot.id);
+    if (!fresh || !fresh.alive) return;
+    const think = botThink(room, fresh);
+    // نفضّلو رد دفاع إذا كانت النية العامة قريبة، وإلا كنخليو شنو قررات الشبكة
+    emitBotChat(room, fresh, think.intent === 'silence_pass'
+      ? { ...think, intent: 'defend_self', text: CHAT_TEMPLATES.defend_self[Math.floor(Math.random() * CHAT_TEMPLATES.defend_self.length)] }
+      : think);
+  }, 1200 + Math.random() * 2200);
+}
 
 /* ------------------------------------------------------------
    الغرف
@@ -150,9 +419,13 @@ function newRoom(hostSocketId) {
     guardedId: null,
     witchHeal: true,
     witchKill: true,
+    witchHealUsedOnTarget: null,
     plagueSickId: null,
     lovers: null,          // [id1, id2]
     thiefSwapped: false,
+    timers: new Set(),     // كل الـ setTimeout الجارية فهاد الغرفة
+    _suspicion: new Map(), // playerId -> عدد المرات اللي اتهم فيها (للبوتات)
+    _justDied: false,
   };
 }
 
@@ -168,14 +441,7 @@ function wolvesOf(room) { return alivePlayers(room).filter(p => roleInfo(p.role)
 function villagersOf(room) { return alivePlayers(room).filter(p => !roleInfo(p.role).wolf); }
 
 function publicPlayer(p) {
-  return {
-    id: p.id,
-    name: p.name,
-    avatar: p.avatar,
-    alive: p.alive,
-    isBot: !!p.isBot,
-    isCreator: creatorSockets.has(p.id), // ✅ الفرونت كيستعمل هاد العلم باش يبين شارة التوثيق
-  };
+  return { id: p.id, name: p.name, avatar: p.avatar, alive: p.alive, isBot: !!p.isBot };
 }
 
 function roomPublicState(room) {
@@ -184,7 +450,6 @@ function roomPublicState(room) {
     state: room.state,
     phase: room.phase,
     day: room.day,
-    host: room.hostId,
     players: room.players.map(publicPlayer),
   };
 }
@@ -196,10 +461,11 @@ function broadcastRoom(room) {
 function addBotsToRoom(room) {
   const humanCount = room.players.filter(p => !p.isBot).length;
   if (humanCount < 2) return;
-  const needed = Math.max(0, MIN_PLAYERS - room.players.length);
+  const needed = Math.max(0, Math.min(MIN_PLAYERS, MAX_PLAYERS) - room.players.length);
   const usedNames = new Set(room.players.map(p => p.name));
   const usedAvatars = new Set(room.players.map(p => p.avatar));
   for (let i = 0; i < needed; i++) {
+    if (room.players.length >= MAX_PLAYERS) break;
     const name = BOT_NAMES.find(n => !usedNames.has(n)) || `بوت ${i + 1}`;
     usedNames.add(name);
     const avatar = BOT_AVATARS.find(a => !usedAvatars.has(a)) || '🤖';
@@ -222,6 +488,7 @@ function assignRoles(room) {
     p.alive = true;
     p.votedFor = null;
     p.lover = false;
+    p._elderHitOnce = false;
   });
 }
 
@@ -238,6 +505,7 @@ function sendRolesToPlayers(room) {
 }
 
 function nightActingOrder(room) {
+  // ترتيب منطقي: كيوبيد (ليلة 1 فقط) → حارس → ذئاب → عرّافة → ساحرة → طبيب الطاعون
   const order = [];
   if (room.day === 1) order.push('CUPID');
   order.push('BODYGUARD', 'WEREWOLF', 'SEER', 'WITCH', 'PLAGUE_DR');
@@ -257,6 +525,7 @@ function startNight(room) {
   room.nightKillTarget = null;
   room.guardedId = null;
   room.plagueSickId = null;
+  room.witchHealUsedOnTarget = null; // 🔧 fix: كان كيبقى محدد من ليلة سابقة ويبلوكي الساحرة غلط
   room.players.forEach(p => { p.votedFor = null; });
   room.nightQueue = nightActingOrder(room);
   room.nightIndex = 0;
@@ -267,6 +536,7 @@ function startNight(room) {
 }
 
 function botAutoNightAction(room, role) {
+  // بوتات كيديرو أكشن عشوائي بسيط باش الليلة توصل للفجر
   if (role === 'WEREWOLF') {
     const candidates = villagersOf(room);
     if (candidates.length) room.nightKillTarget = candidates[Math.floor(Math.random() * candidates.length)].id;
@@ -277,6 +547,7 @@ function botAutoNightAction(room, role) {
     const candidates = alivePlayers(room);
     if (candidates.length && Math.random() > 0.5) room.plagueSickId = candidates[Math.floor(Math.random() * candidates.length)].id;
   }
+  // السحرة والعرّافة والكيوبيد للبوتات: تخطي بسيط (ما كيأثرش سلباً على التوازن)
 }
 
 function advanceNightStep(room) {
@@ -290,6 +561,7 @@ function advanceNightStep(room) {
   const botHolders = holders.filter(p => p.isBot);
 
   botHolders.forEach(() => botAutoNightAction(room, role));
+  if (role === 'WEREWOLF' && botHolders.length) scheduleWolfChat(room);
 
   if (humanHolders.length === 0) {
     room.nightIndex++;
@@ -332,6 +604,7 @@ function advanceNightStep(room) {
 function resolveNight(room) {
   const events = [];
   const wolfTarget = room.nightKillTarget;
+  let anyDeath = false;
 
   if (wolfTarget) {
     let blocked = false;
@@ -344,6 +617,7 @@ function resolveNight(room) {
         events.push(`👴 ${target.name} (شيخ القرية) صمد أمام هجوم الذئاب!`);
       } else {
         target.alive = false;
+        anyDeath = true;
         events.push(`💀 وُجد ${target.name} (${roleInfo(target.role).name}) ميتاً عند الفجر!`);
         killLoverIfNeeded(room, target, events);
         if (target.role === 'HUNTER') notifyHunter(room, target);
@@ -355,6 +629,7 @@ function resolveNight(room) {
     const t = room.players.find(p => p.id === room._witchPoisonTarget);
     if (t && t.alive) {
       t.alive = false;
+      anyDeath = true;
       events.push(`☠️ الساحرة سمّت ${t.name}!`);
       killLoverIfNeeded(room, t, events);
       if (t.role === 'HUNTER') notifyHunter(room, t);
@@ -365,13 +640,14 @@ function resolveNight(room) {
   if (!events.length) events.push('🌙 ليلة هادئة، لم يمت أحد.');
 
   room.nightEvents = events;
+  room._justDied = anyDeath;
   io.to(room.code).emit('phase:dawn', { events, day: room.day });
 
   const win = checkWin(room);
   broadcastRoom(room);
   if (win) { endGame(room, win); return; }
 
-  setTimeout(() => startDay(room), 4000);
+  addTimer(room, () => startDay(room), 4000);
 }
 
 function killLoverIfNeeded(room, deadPlayer, events) {
@@ -396,7 +672,8 @@ function startDay(room) {
   room.players.forEach(p => { p.votedFor = null; });
   io.to(room.code).emit('phase:day', { day: room.day });
   broadcastRoom(room);
-  setTimeout(() => openVote(room), 45000);
+  scheduleDayChat(room);
+  addTimer(room, () => openVote(room), 45000);
 }
 
 function openVote(room) {
@@ -405,9 +682,10 @@ function openVote(room) {
   alivePlayers(room).filter(p => !p.isBot).forEach(p => {
     io.to(p.id).emit('vote:open', { candidates: candidates.filter(c => c.id !== p.id) });
   });
+  // بوتات كيصوتو — كيفضلو الهدف اللي جمع شكوك أكثر (نفس المنطق ديال pickTarget)
   alivePlayers(room).filter(p => p.isBot).forEach(p => {
-    const options = alivePlayers(room).filter(x => x.id !== p.id);
-    if (options.length) p.votedFor = options[Math.floor(Math.random() * options.length)].id;
+    const target = pickTarget(room, p, false);
+    if (target) p.votedFor = target.id;
   });
   checkVotesComplete(room);
 }
@@ -422,12 +700,13 @@ function checkVotesComplete(room) {
   voted.forEach(p => { tally[p.votedFor] = (tally[p.votedFor] || 0) + 1; });
   const sorted = Object.entries(tally).sort((a, b) => b[1] - a[1]);
   io.to(room.code).emit('vote:result', { tally });
-  if (!sorted.length) { setTimeout(() => startNight2(room), 2000); return; }
+  if (!sorted.length) { addTimer(room, () => startNight2(room), 2000); return; }
 
   const [condemnedId] = sorted[0];
   const condemned = room.players.find(p => p.id === condemnedId);
   if (condemned && condemned.alive) {
     condemned.alive = false;
+    room._suspicion && room._suspicion.delete(condemned.id);
     io.to(room.code).emit('vote:condemned', { player: { ...publicPlayer(condemned), roleInfo: roleInfo(condemned.role) } });
     if (condemned.role === 'HUNTER') notifyHunter(room, condemned);
     const evts = [];
@@ -437,7 +716,7 @@ function checkVotesComplete(room) {
   broadcastRoom(room);
   const win = checkWin(room);
   if (win) { endGame(room, win); return; }
-  setTimeout(() => startNight2(room), 3000);
+  addTimer(room, () => startNight2(room), 3000);
 }
 
 function startNight2(room) {
@@ -455,10 +734,35 @@ function checkWin(room) {
 
 function endGame(room, winner) {
   room.state = 'ended';
+  clearRoomTimers(room);
   io.to(room.code).emit('game:end', {
     winner,
     players: room.players.map(p => ({ ...publicPlayer(p), role: p.role, roleInfo: roleInfo(p.role) })),
   });
+}
+
+/* ------------------------------------------------------------
+   يعالج مغادرة لاعب فالنص لعبة: بلا هادشي كانت الليلة/التصويت
+   يقدر يوقف بلا ما يكمل (خاصة إذا كان هو اللي خاصو يدير أكشن)
+   ------------------------------------------------------------ */
+function handlePlayerRemovedDuringGame(room, leftPlayerId) {
+  if (room.state !== 'playing') return;
+
+  if (room.phase === 'night' && room._pendingHumans && room._pendingHumans.has(leftPlayerId)) {
+    room._pendingHumans.delete(leftPlayerId);
+    if (room._pendingHumans.size === 0) {
+      room.nightIndex++;
+      advanceNightStep(room);
+    }
+    return;
+  }
+
+  if (room.phase === 'day') {
+    checkVotesComplete(room);
+  }
+
+  const win = checkWin(room);
+  if (win) endGame(room, win);
 }
 
 /* ------------------------------------------------------------
@@ -490,7 +794,7 @@ io.on('connection', (socket) => {
     const room = rooms.get((code || '').toUpperCase());
     if (!room) { socket.emit('room:error', 'الغرفة غير موجودة'); return; }
     if (room.state !== 'lobby') { socket.emit('room:error', 'اللعبة بدأت بالفعل'); return; }
-    if (room.players.length >= 12) { socket.emit('room:error', 'الغرفة ممتلئة'); return; }
+    if (room.players.length >= MAX_PLAYERS) { socket.emit('room:error', 'الغرفة ممتلئة'); return; }
     room.players.push({
       id: socket.id, name: (playerName || 'لاعب').slice(0, 20), avatar: '🧑',
       role: null, alive: true, votedFor: null, isBot: false, lover: false,
@@ -503,6 +807,7 @@ io.on('connection', (socket) => {
   socket.on('game:start', () => {
     const room = findRoomBySocket(socket.id);
     if (!room || room.hostId !== socket.id) return;
+    if (room.state !== 'lobby') return;
     if (room.players.filter(p => !p.isBot).length < 2) {
       socket.emit('room:error', 'خاصك لاعب آخر واحد على الأقل باش تبدا');
       return;
@@ -516,9 +821,10 @@ io.on('connection', (socket) => {
     room.state = 'playing';
     room.day = 1;
     room.lovers = null;
+    room._suspicion = new Map();
     broadcastRoom(room);
     sendRolesToPlayers(room);
-    setTimeout(() => startNight(room), 5000);
+    addTimer(room, () => startNight(room), 5000);
   });
 
   socket.on('night:submit', (data) => {
@@ -589,102 +895,54 @@ io.on('connection', (socket) => {
     if (win) endGame(room, win);
   });
 
+  // ---------------- الشات: بشر + بوتات كيتفاعلو ----------------
   socket.on('chat:send', ({ text }) => {
     const room = findRoomBySocket(socket.id);
     if (!room) return;
     const player = room.players.find(p => p.id === socket.id);
     if (!player || !player.alive) return;
     if (!text || !String(text).trim()) return;
+    const cleanText = String(text).slice(0, 300);
     const isWolfChat = room.phase === 'night' && roleInfo(player.role).wolf;
-    const msg = {
-      sender: player.name,
-      senderId: player.id, // ✅ الفرونت كيستعملو باش يتأكد واش المرسل هو الكرييتور
-      avatar: player.avatar,
-      text: String(text).slice(0, 300),
-      isWolfOnly: isWolfChat,
-    };
+    const msg = { sender: player.name, avatar: player.avatar, text: cleanText, isWolfOnly: isWolfChat, isBot: false };
     if (isWolfChat) {
       wolvesOf(room).filter(w => !w.isBot).forEach(w => io.to(w.id).emit('chat:message', msg));
     } else {
       io.to(room.code).emit('chat:message', msg);
-    }
-  });
-
-  /* ======================================================
-     Creator auth & tools — نظام واحد نظيف (بلا تضارب)
-     ====================================================== */
-
-  // الفرونت كيبعث { code, deviceToken } — كنقبلو كذلك string وحدها للتوافق القديم
-  socket.on('creator:auth', (payload) => {
-    const code = (typeof payload === 'string') ? payload : ((payload && payload.code) || '');
-    const deviceToken = (payload && typeof payload === 'object') ? (payload.deviceToken || null) : null;
-
-    if (isPermanentlyBannedDevice({ id: socket.id, deviceToken, ip })) {
-      socket.emit('creator:error', 'أنت محظور نهائياً.');
-      return;
-    }
-
-    if (!CREATOR_SECRET) {
-      socket.emit('creator:error', 'ميزة المطور غير مفعّلة على هاد السيرفر');
-      return;
-    }
-    if (code !== CREATOR_SECRET) {
-      socket.emit('creator:error', 'الكود غير صحيح');
-      return;
-    }
-
-    // ── الحالة 1: ماكاينش جهاز مسجل بعد → هذا أول واحد، يتسجل كالكرييتور الرسمي
-    if (!creatorState.deviceToken) {
-      creatorState.deviceToken = deviceToken;
-      creatorState.name = 'Alaa Dev';
-      saveJSON(STATE_FILE, creatorState);
-      acceptAsCreator(socket);
-      return;
-    }
-
-    // ── الحالة 2: نفس الجهاز المسجل من قبل (أو ماكاينش deviceToken أصلاً، توافق قديم) → نقبلو
-    if (!deviceToken || creatorState.deviceToken === deviceToken) {
-      acceptAsCreator(socket);
-      return;
-    }
-
-    // ── الحالة 3: جهاز آخر عرف الكود → رفض + إشعار للكرييتور الحقيقي
-    socket.emit('creator:error', 'هاد الكود مربوط بجهاز آخر.');
-    if (creatorSocketRef && creatorSocketRef.connected) {
-      const room = findRoomBySocket(socket.id);
-      const playerRec = room && room.players.find(p => p.id === socket.id);
-      creatorSocketRef.emit('creator:intrusion', {
-        id: socket.id,
-        name: (playerRec && playerRec.name) || null,
-        deviceToken,
-        ip,
+      // 🤖 إذا شي بوت تسمى فالرسالة، كيرد يدافع عن راسو بعد شوية
+      alivePlayers(room).filter(p => p.isBot).forEach(bot => {
+        if (cleanText.includes(bot.name)) {
+          bumpSuspicion(room, bot.id);
+          scheduleBotDefense(room, bot);
+        }
       });
     }
   });
 
-  function acceptAsCreator(sock) {
-    creatorSockets.add(sock.id);
-    creatorSocketRef = sock;
-    sock.emit('creator:ok', { id: sock.id, name: creatorState.name || 'Alaa Dev' });
-    console.log(`👑 Creator authenticated: ${sock.id} (${ip})`);
-    const room = findRoomBySocket(sock.id);
-    if (room) broadcastRoom(room);
-  }
+  /* ---------------- Creator auth & tools ---------------- */
 
-  // استرجاع صفة الكرييتور تلقائياً بعد Reload بلا إعادة إدخال الكود
-  socket.on('creator:resume', (payload) => {
-    const deviceToken = (payload && payload.deviceToken) || null;
-    if (deviceToken && creatorState.deviceToken && creatorState.deviceToken === deviceToken) {
-      acceptAsCreator(socket);
+  socket.on('creator:auth', (code) => {
+    if (!CREATOR_SECRET) {
+      socket.emit('creator:error', 'ميزة المطور غير مفعّلة على هاد السيرفر');
+      return;
     }
-    // إذا ماكانش معروف، صامت — بلا رسالة خطأ
+    if (code === CREATOR_SECRET) {
+      creatorSockets.add(socket.id);
+      const room = findRoomBySocket(socket.id);
+      socket.emit('creator:ok', { name: 'Alaa Dev' });
+      console.log(`👑 Creator authenticated: ${socket.id} (${ip})`);
+      if (room) broadcastRoom(room);
+    } else {
+      socket.emit('creator:error', 'الكود غير صحيح');
+    }
   });
 
   socket.on('creator:addBots', ({ count }) => {
     requireCreator(socket, () => {
       const room = findRoomBySocket(socket.id);
       if (!room) return;
-      const n = Math.max(1, Math.min(parseInt(count, 10) || 1, 10));
+      const room_cap = Math.max(0, MAX_PLAYERS - room.players.length);
+      const n = Math.max(0, Math.min(parseInt(count, 10) || 1, room_cap));
       const usedNames = new Set(room.players.map(p => p.name));
       const usedAvatars = new Set(room.players.map(p => p.avatar));
       for (let i = 0; i < n; i++) {
@@ -706,50 +964,38 @@ io.on('connection', (socket) => {
       if (idx === -1) return;
       io.to(targetId).emit('room:error', 'تم طردك من قِبل المطور');
       room.players.splice(idx, 1);
+      handlePlayerRemovedDuringGame(room, targetId);
+      if (room.players.length === 0) { rooms.delete(room.code); return; }
       broadcastRoom(room);
     });
   });
 
-  // حظر: type = 'session' (يقدر يرجع يدخل) أو 'permanent' (مسجل بالملف، ما كيضيعش عند إعادة التشغيل)
-  socket.on('creator:ban', ({ targetId, deviceToken, type, reason }) => {
+  // حظر: type = 'session' (يقدر يرجع يدخل من بعد) أو 'permanent' (حتى يتعاود تشغيل السيرفر)
+  socket.on('creator:ban', ({ targetId, type }) => {
     requireCreator(socket, () => {
       const room = findRoomBySocket(socket.id);
+      if (!room) return;
+      const idx = room.players.findIndex(p => p.id === targetId);
+      if (idx === -1) return;
       const targetSocket = io.sockets.sockets.get(targetId);
       const targetIP = targetSocket ? getClientIP(targetSocket) : null;
-      const targetName = room ? (room.players.find(p => p.id === targetId) || {}).name : null;
-
-      if (type === 'permanent') {
-        permanentBans.push({
-          id: targetId || null,
-          name: targetName || null,
-          deviceToken: deviceToken || null,
-          ip: targetIP || null,
-          reason: reason || 'creator_ban',
-          bannedAt: Date.now(),
-        });
-        saveJSON(BANS_FILE, permanentBans);
-        if (targetIP) permBannedIPs.add(targetIP);
-      } else if (targetIP) {
-        sessionBannedIPs.add(targetIP);
+      if (targetIP) {
+        if (type === 'permanent') permBannedIPs.add(targetIP);
+        else sessionBannedIPs.add(targetIP);
       }
-
       io.to(targetId).emit('room:error', type === 'permanent' ? 'تم حظرك بشكل دائم' : 'تم حظرك من قِبل المطور');
       if (targetSocket) targetSocket.disconnect(true);
-
-      if (room) {
-        const idx = room.players.findIndex(p => p.id === targetId);
-        if (idx !== -1) room.players.splice(idx, 1);
-        broadcastRoom(room);
-      }
+      room.players.splice(idx, 1);
+      handlePlayerRemovedDuringGame(room, targetId);
+      if (room.players.length === 0) { rooms.delete(room.code); return; }
+      broadcastRoom(room);
     });
   });
 
-  socket.on('creator:unban', (ip2) => {
+  socket.on('creator:unban', (ip) => {
     requireCreator(socket, () => {
-      permBannedIPs.delete(ip2);
-      sessionBannedIPs.delete(ip2);
-      permanentBans = permanentBans.filter(b => b.ip !== ip2);
-      saveJSON(BANS_FILE, permanentBans);
+      permBannedIPs.delete(ip);
+      sessionBannedIPs.delete(ip);
       socket.emit('creator:banList', { permanent: [...permBannedIPs], session: [...sessionBannedIPs] });
     });
   });
@@ -793,7 +1039,10 @@ io.on('connection', (socket) => {
     requireCreator(socket, () => {
       const room = findRoomBySocket(socket.id);
       if (!room) return;
+      clearRoomTimers(room);
       room.state = 'lobby'; room.phase = 'night'; room.day = 1;
+      room._suspicion = new Map();
+      room._justDied = false;
       room.players.forEach(p => { p.role = null; p.alive = true; p.votedFor = null; p.lover = false; });
       broadcastRoom(room);
     });
@@ -801,7 +1050,6 @@ io.on('connection', (socket) => {
 
   socket.on('disconnect', () => {
     creatorSockets.delete(socket.id);
-    if (creatorSocketRef === socket) creatorSocketRef = null;
     const room = findRoomBySocket(socket.id);
     if (!room) return;
     const idx = room.players.findIndex(p => p.id === socket.id);
@@ -810,13 +1058,15 @@ io.on('connection', (socket) => {
     room.players.splice(idx, 1);
     console.log(`❌ ${left.name} غادر الغرفة ${room.code}`);
     if (room.players.length === 0) {
+      clearRoomTimers(room);
       rooms.delete(room.code);
       return;
     }
     if (room.hostId === socket.id) {
       room.hostId = room.players[0].id;
     }
-    broadcastRoom(room);
+    handlePlayerRemovedDuringGame(room, socket.id);
+    if (rooms.has(room.code)) broadcastRoom(room);
   });
 });
 
