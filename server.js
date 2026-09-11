@@ -14,18 +14,43 @@ app.use(express.static(__dirname));
 
 /* ------------------------------------------------------------
    Creator auth (آمن): السر كيتقارن فالسيرفر فقط.
-   خاصك تصاوب متغير بيئة قبل التشغيل، مثلاً:
+   ⚠️ هادشي هو السر الحقيقي ديالك، مكتوب هنا كـ fallback باش
+   يخدم حتى إلا ماكانتش environment variable معرفة.
+   إلا بغيتي تبدلو من متغير بيئة، دير:
      CREATOR_SECRET=IAM-ALAA-DEVOFLOUPPY node server.js
    ------------------------------------------------------------ */
-const CREATOR_SECRET = process.env.CREATOR_SECRET || null;
+const CREATOR_SECRET = process.env.CREATOR_SECRET || 'IAM-ALAA-DEVOFLOUPPY';
+console.log('[creator] CREATOR_SECRET جاهز:', CREATOR_SECRET ? '✅' : '❌ غير معرف!');
 
-// socket.id ديال أي واحد أثبت أنه Creator فهاد الجلسة الحالية ديال السيرفر
+/* ------------------------------------------------------------
+   Creator device-lock: نظام قفل الكود لأول جهاز ينجح بيه
+   ------------------------------------------------------------ */
+const fs = require('fs');
+const path = require('path');
+const STATE_FILE = path.join(__dirname, 'creator-state.json');
+const BANS_FILE  = path.join(__dirname, 'permanent-bans.json');
+
+function loadJSON(file, fallback) {
+  try { return JSON.parse(fs.readFileSync(file, 'utf8')); }
+  catch (e) { return fallback; }
+}
+function saveJSON(file, data) {
+  try { fs.writeFileSync(file, JSON.stringify(data, null, 2)); }
+  catch (e) { console.error('فشل الحفظ:', file, e); }
+}
+
+// { deviceToken: string|null, name: string|null }
+let creatorState = loadJSON(STATE_FILE, { deviceToken: null, name: null });
+// [{ id, name, deviceToken, ip, reason, bannedAt }]
+let permanentBans = loadJSON(BANS_FILE, []);
+
+// socket.id ديال أي واحد أثبت أنه Creator فهاد الجلسة الحالية
 const creatorSockets = new Set();
+// مرجع للسوكيت الحالي ديال الكرييتور (باش نبعثو ليه إشعارات الاختراق)
+let creatorSocketRef = null;
 
-// IPs محظورة بشكل دائم (كتضيع لما يعاود يتشغل السيرفر — حسب الطلب)
-const permBannedIPs = new Set();
-// IPs محظورة مؤقتاً لهاد التشغيلة الحالية فقط لكن كتفرق عن permanent فكونها بلا فرق تقني هنا،
-// خصصنا set وحدة، والفرق كيبان غير فكيفاش كتزاد (شوف creator:ban)
+// IPs محظورة بشكل دائم / مؤقت (session)
+const permBannedIPs = new Set(permanentBans.map(b => b.ip).filter(Boolean));
 const sessionBannedIPs = new Set();
 
 function getClientIP(socket) {
@@ -36,6 +61,14 @@ function getClientIP(socket) {
 
 function isBannedIP(ip) {
   return permBannedIPs.has(ip) || sessionBannedIPs.has(ip);
+}
+
+function isPermanentlyBannedDevice({ id, deviceToken, ip }) {
+  return permanentBans.some(b =>
+    (deviceToken && b.deviceToken === deviceToken) ||
+    (ip && b.ip === ip) ||
+    (id && b.id === id)
+  );
 }
 
 function isCreator(socket) {
@@ -135,7 +168,14 @@ function wolvesOf(room) { return alivePlayers(room).filter(p => roleInfo(p.role)
 function villagersOf(room) { return alivePlayers(room).filter(p => !roleInfo(p.role).wolf); }
 
 function publicPlayer(p) {
-  return { id: p.id, name: p.name, avatar: p.avatar, alive: p.alive, isBot: !!p.isBot };
+  return {
+    id: p.id,
+    name: p.name,
+    avatar: p.avatar,
+    alive: p.alive,
+    isBot: !!p.isBot,
+    isCreator: creatorSockets.has(p.id), // ✅ الفرونت كيستعمل هاد العلم باش يبين شارة التوثيق
+  };
 }
 
 function roomPublicState(room) {
@@ -144,6 +184,7 @@ function roomPublicState(room) {
     state: room.state,
     phase: room.phase,
     day: room.day,
+    host: room.hostId,
     players: room.players.map(publicPlayer),
   };
 }
@@ -197,7 +238,6 @@ function sendRolesToPlayers(room) {
 }
 
 function nightActingOrder(room) {
-  // ترتيب منطقي: كيوبيد (ليلة 1 فقط) → حارس → ذئاب → عرّافة → ساحرة → طبيب الطاعون
   const order = [];
   if (room.day === 1) order.push('CUPID');
   order.push('BODYGUARD', 'WEREWOLF', 'SEER', 'WITCH', 'PLAGUE_DR');
@@ -227,8 +267,6 @@ function startNight(room) {
 }
 
 function botAutoNightAction(room, role) {
-  // بوتات كيديرو أكشن عشوائي بسيط باش الليلة توصل للفجر
-  const targets = alivePlayers(room).filter(p => p.role !== role || role !== 'WEREWOLF');
   if (role === 'WEREWOLF') {
     const candidates = villagersOf(room);
     if (candidates.length) room.nightKillTarget = candidates[Math.floor(Math.random() * candidates.length)].id;
@@ -239,7 +277,6 @@ function botAutoNightAction(room, role) {
     const candidates = alivePlayers(room);
     if (candidates.length && Math.random() > 0.5) room.plagueSickId = candidates[Math.floor(Math.random() * candidates.length)].id;
   }
-  // السحرة والعرّافة والكيوبيد للبوتات: تخطي بسيط (ما كيأثرش سلباً على التوازن)
 }
 
 function advanceNightStep(room) {
@@ -288,7 +325,6 @@ function advanceNightStep(room) {
     }
   });
 
-  // بوتات باقيين فأدوار أخرى فحال ماكانش بشر فهاد الدور، صافي — كيتسناو submit ديال البشر
   room._pendingRole = role;
   room._pendingHumans = new Set(humanHolders.map(p => p.id));
 }
@@ -369,7 +405,6 @@ function openVote(room) {
   alivePlayers(room).filter(p => !p.isBot).forEach(p => {
     io.to(p.id).emit('vote:open', { candidates: candidates.filter(c => c.id !== p.id) });
   });
-  // بوتات كيصوتو عشوائياً
   alivePlayers(room).filter(p => p.isBot).forEach(p => {
     const options = alivePlayers(room).filter(x => x.id !== p.id);
     if (options.length) p.votedFor = options[Math.floor(Math.random() * options.length)].id;
@@ -561,7 +596,13 @@ io.on('connection', (socket) => {
     if (!player || !player.alive) return;
     if (!text || !String(text).trim()) return;
     const isWolfChat = room.phase === 'night' && roleInfo(player.role).wolf;
-    const msg = { sender: player.name, avatar: player.avatar, text: String(text).slice(0, 300), isWolfOnly: isWolfChat };
+    const msg = {
+      sender: player.name,
+      senderId: player.id, // ✅ الفرونت كيستعملو باش يتأكد واش المرسل هو الكرييتور
+      avatar: player.avatar,
+      text: String(text).slice(0, 300),
+      isWolfOnly: isWolfChat,
+    };
     if (isWolfChat) {
       wolvesOf(room).filter(w => !w.isBot).forEach(w => io.to(w.id).emit('chat:message', msg));
     } else {
@@ -569,22 +610,74 @@ io.on('connection', (socket) => {
     }
   });
 
-  /* ---------------- Creator auth & tools ---------------- */
+  /* ======================================================
+     Creator auth & tools — نظام واحد نظيف (بلا تضارب)
+     ====================================================== */
 
-  socket.on('creator:auth', (code) => {
+  // الفرونت كيبعث { code, deviceToken } — كنقبلو كذلك string وحدها للتوافق القديم
+  socket.on('creator:auth', (payload) => {
+    const code = (typeof payload === 'string') ? payload : ((payload && payload.code) || '');
+    const deviceToken = (payload && typeof payload === 'object') ? (payload.deviceToken || null) : null;
+
+    if (isPermanentlyBannedDevice({ id: socket.id, deviceToken, ip })) {
+      socket.emit('creator:error', 'أنت محظور نهائياً.');
+      return;
+    }
+
     if (!CREATOR_SECRET) {
       socket.emit('creator:error', 'ميزة المطور غير مفعّلة على هاد السيرفر');
       return;
     }
-    if (code === CREATOR_SECRET) {
-      creatorSockets.add(socket.id);
-      const room = findRoomBySocket(socket.id);
-      socket.emit('creator:ok', { name: 'Alaa Dev' });
-      console.log(`👑 Creator authenticated: ${socket.id} (${ip})`);
-      if (room) broadcastRoom(room);
-    } else {
+    if (code !== CREATOR_SECRET) {
       socket.emit('creator:error', 'الكود غير صحيح');
+      return;
     }
+
+    // ── الحالة 1: ماكاينش جهاز مسجل بعد → هذا أول واحد، يتسجل كالكرييتور الرسمي
+    if (!creatorState.deviceToken) {
+      creatorState.deviceToken = deviceToken;
+      creatorState.name = 'Alaa Dev';
+      saveJSON(STATE_FILE, creatorState);
+      acceptAsCreator(socket);
+      return;
+    }
+
+    // ── الحالة 2: نفس الجهاز المسجل من قبل (أو ماكاينش deviceToken أصلاً، توافق قديم) → نقبلو
+    if (!deviceToken || creatorState.deviceToken === deviceToken) {
+      acceptAsCreator(socket);
+      return;
+    }
+
+    // ── الحالة 3: جهاز آخر عرف الكود → رفض + إشعار للكرييتور الحقيقي
+    socket.emit('creator:error', 'هاد الكود مربوط بجهاز آخر.');
+    if (creatorSocketRef && creatorSocketRef.connected) {
+      const room = findRoomBySocket(socket.id);
+      const playerRec = room && room.players.find(p => p.id === socket.id);
+      creatorSocketRef.emit('creator:intrusion', {
+        id: socket.id,
+        name: (playerRec && playerRec.name) || null,
+        deviceToken,
+        ip,
+      });
+    }
+  });
+
+  function acceptAsCreator(sock) {
+    creatorSockets.add(sock.id);
+    creatorSocketRef = sock;
+    sock.emit('creator:ok', { id: sock.id, name: creatorState.name || 'Alaa Dev' });
+    console.log(`👑 Creator authenticated: ${sock.id} (${ip})`);
+    const room = findRoomBySocket(sock.id);
+    if (room) broadcastRoom(room);
+  }
+
+  // استرجاع صفة الكرييتور تلقائياً بعد Reload بلا إعادة إدخال الكود
+  socket.on('creator:resume', (payload) => {
+    const deviceToken = (payload && payload.deviceToken) || null;
+    if (deviceToken && creatorState.deviceToken && creatorState.deviceToken === deviceToken) {
+      acceptAsCreator(socket);
+    }
+    // إذا ماكانش معروف، صامت — بلا رسالة خطأ
   });
 
   socket.on('creator:addBots', ({ count }) => {
@@ -611,38 +704,52 @@ io.on('connection', (socket) => {
       if (!room) return;
       const idx = room.players.findIndex(p => p.id === targetId);
       if (idx === -1) return;
-      const kicked = room.players[idx];
       io.to(targetId).emit('room:error', 'تم طردك من قِبل المطور');
       room.players.splice(idx, 1);
       broadcastRoom(room);
     });
   });
 
-  // حظر: type = 'session' (يقدر يرجع يدخل من بعد) أو 'permanent' (حتى يتعاود تشغيل السيرفر)
-  socket.on('creator:ban', ({ targetId, type }) => {
+  // حظر: type = 'session' (يقدر يرجع يدخل) أو 'permanent' (مسجل بالملف، ما كيضيعش عند إعادة التشغيل)
+  socket.on('creator:ban', ({ targetId, deviceToken, type, reason }) => {
     requireCreator(socket, () => {
       const room = findRoomBySocket(socket.id);
-      if (!room) return;
-      const idx = room.players.findIndex(p => p.id === targetId);
-      if (idx === -1) return;
-      const target = room.players[idx];
       const targetSocket = io.sockets.sockets.get(targetId);
       const targetIP = targetSocket ? getClientIP(targetSocket) : null;
-      if (targetIP) {
-        if (type === 'permanent') permBannedIPs.add(targetIP);
-        else sessionBannedIPs.add(targetIP);
+      const targetName = room ? (room.players.find(p => p.id === targetId) || {}).name : null;
+
+      if (type === 'permanent') {
+        permanentBans.push({
+          id: targetId || null,
+          name: targetName || null,
+          deviceToken: deviceToken || null,
+          ip: targetIP || null,
+          reason: reason || 'creator_ban',
+          bannedAt: Date.now(),
+        });
+        saveJSON(BANS_FILE, permanentBans);
+        if (targetIP) permBannedIPs.add(targetIP);
+      } else if (targetIP) {
+        sessionBannedIPs.add(targetIP);
       }
+
       io.to(targetId).emit('room:error', type === 'permanent' ? 'تم حظرك بشكل دائم' : 'تم حظرك من قِبل المطور');
       if (targetSocket) targetSocket.disconnect(true);
-      room.players.splice(idx, 1);
-      broadcastRoom(room);
+
+      if (room) {
+        const idx = room.players.findIndex(p => p.id === targetId);
+        if (idx !== -1) room.players.splice(idx, 1);
+        broadcastRoom(room);
+      }
     });
   });
 
-  socket.on('creator:unban', (ip) => {
+  socket.on('creator:unban', (ip2) => {
     requireCreator(socket, () => {
-      permBannedIPs.delete(ip);
-      sessionBannedIPs.delete(ip);
+      permBannedIPs.delete(ip2);
+      sessionBannedIPs.delete(ip2);
+      permanentBans = permanentBans.filter(b => b.ip !== ip2);
+      saveJSON(BANS_FILE, permanentBans);
       socket.emit('creator:banList', { permanent: [...permBannedIPs], session: [...sessionBannedIPs] });
     });
   });
@@ -692,15 +799,9 @@ io.on('connection', (socket) => {
     });
   });
 
-   const { registerCreatorHandlers } = require('./creator-server-snippet');
-
-io.on('connection', (socket) => {
- 
-  registerCreatorHandlers(io, socket);
-});
-
   socket.on('disconnect', () => {
     creatorSockets.delete(socket.id);
+    if (creatorSocketRef === socket) creatorSocketRef = null;
     const room = findRoomBySocket(socket.id);
     if (!room) return;
     const idx = room.players.findIndex(p => p.id === socket.id);
