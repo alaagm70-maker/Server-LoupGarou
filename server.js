@@ -692,6 +692,13 @@ io.on('connection', (socket) => {
     });
   });
 
+   const { registerCreatorHandlers } = require('./creator-server-snippet');
+
+io.on('connection', (socket) => {
+ 
+  registerCreatorHandlers(io, socket);
+});
+
   socket.on('disconnect', () => {
     creatorSockets.delete(socket.id);
     const room = findRoomBySocket(socket.id);
