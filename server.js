@@ -7,6 +7,7 @@
      لتوليد نص حر — النصوص نفسها مبنية من بنك جمل جاهزة (توكنات/عبارات)
      باش تبقى مفهومة ومتماسكة.
    =========================================================- */
+const crypto = require('crypto');
 const express = require('express');
 const app = express();
 const http = require('http').createServer(app);
@@ -22,9 +23,58 @@ app.use(express.static(__dirname));
      CREATOR_SECRET=IAM-ALAA-DEVOFLOUPPY node server.js
    ------------------------------------------------------------ */
 const CREATOR_SECRET = process.env.CREATOR_SECRET || null;
+const CREATOR_SECRET_BUF = CREATOR_SECRET ? Buffer.from(CREATOR_SECRET) : null;
 
 // socket.id ديال أي واحد أثبت أنه Creator فهاد الجلسة الحالية ديال السيرفر
 const creatorSockets = new Set();
+
+// حماية ضد brute force: عدد المحاولات الفاشلة لكل IP + وقت آخر محاولة
+const creatorAuthAttempts = new Map(); // ip -> { count, firstAttemptAt, blockedUntil }
+const CREATOR_AUTH_MAX_ATTEMPTS = 5;
+const CREATOR_AUTH_WINDOW_MS = 60 * 1000;   // نافذة دقيقة وحدة
+const CREATOR_AUTH_BLOCK_MS = 5 * 60 * 1000; // بلوكاج 5 دقايق بعد ما تنهار المحاولات
+
+// مقارنة آمنة ضد الأسرار (ثابتة فالوقت، ما كتبانش من طول أو محتوى النص)
+function safeCompareSecret(input) {
+  if (!CREATOR_SECRET_BUF || typeof input !== 'string') return false;
+  const inputBuf = Buffer.from(input);
+  // خاص نفس الطول باش نقارنو بـ timingSafeEqual، وإلا كندير مقارنة وهمية
+  // بنفس المدة تقريباً باش ما نبانوش الفرق فالطول عبر التوقيت
+  if (inputBuf.length !== CREATOR_SECRET_BUF.length) {
+    crypto.timingSafeEqual(CREATOR_SECRET_BUF, CREATOR_SECRET_BUF);
+    return false;
+  }
+  return crypto.timingSafeEqual(inputBuf, CREATOR_SECRET_BUF);
+}
+
+// كيرجع true إذا هاد الـ IP بلوكي دابا بسبب محاولات كثيرة
+function isCreatorAuthBlocked(ip) {
+  const rec = creatorAuthAttempts.get(ip);
+  if (!rec) return false;
+  if (rec.blockedUntil && Date.now() < rec.blockedUntil) return true;
+  if (rec.blockedUntil && Date.now() >= rec.blockedUntil) {
+    creatorAuthAttempts.delete(ip);
+    return false;
+  }
+  return false;
+}
+
+function registerFailedCreatorAuth(ip) {
+  const now = Date.now();
+  let rec = creatorAuthAttempts.get(ip);
+  if (!rec || now - rec.firstAttemptAt > CREATOR_AUTH_WINDOW_MS) {
+    rec = { count: 0, firstAttemptAt: now, blockedUntil: null };
+  }
+  rec.count++;
+  if (rec.count >= CREATOR_AUTH_MAX_ATTEMPTS) {
+    rec.blockedUntil = now + CREATOR_AUTH_BLOCK_MS;
+  }
+  creatorAuthAttempts.set(ip, rec);
+}
+
+function clearCreatorAuthAttempts(ip) {
+  creatorAuthAttempts.delete(ip);
+}
 
 // IPs محظورة بشكل دائم (كتضيع لما يعاود يتشغل السيرفر — حسب الطلب)
 const permBannedIPs = new Set();
@@ -535,7 +585,7 @@ function startNight(room) {
   advanceNightStep(room);
 }
 
-function botAutoNightAction(room, role) {
+function botAutoNightAction(room, bot, role) {
   // بوتات كيديرو أكشن عشوائي بسيط باش الليلة توصل للفجر
   if (role === 'WEREWOLF') {
     const candidates = villagersOf(room);
@@ -546,8 +596,37 @@ function botAutoNightAction(room, role) {
   } else if (role === 'PLAGUE_DR') {
     const candidates = alivePlayers(room);
     if (candidates.length && Math.random() > 0.5) room.plagueSickId = candidates[Math.floor(Math.random() * candidates.length)].id;
+  } else if (role === 'SEER' && bot) {
+    // بوت العرّافة: كيختار هدف عشوائي ويشوف دوره (نفس منطق pickTarget، بلا تأثير خارجي)
+    const candidates = alivePlayers(room).filter(p => p.id !== bot.id);
+    if (candidates.length) {
+      const target = candidates[Math.floor(Math.random() * candidates.length)];
+      // إذا الهدف ذيب، البوت كيزيد شك عليه (كيفعل بالمعلومة كيما لاعب حقيقي)
+      if (roleInfo(target.role).wolf) bumpSuspicion(room, target.id);
+    }
+  } else if (role === 'WITCH' && bot) {
+    // بوت الساحرة: عشوائياً كيقرر يعالج ضحية الذئاب و/أو يسمم لاعب آخر
+    if (room.witchHeal && room.nightKillTarget && Math.random() > 0.5) {
+      room.witchHeal = false;
+      room.witchHealUsedOnTarget = room.nightKillTarget;
+      room.nightKillTarget = null;
+    } else if (room.witchKill && Math.random() > 0.75) {
+      const candidates = alivePlayers(room).filter(p => p.id !== bot.id);
+      if (candidates.length) {
+        room.witchKill = false;
+        room._witchPoisonTarget = candidates[Math.floor(Math.random() * candidates.length)].id;
+      }
+    }
+  } else if (role === 'CUPID' && bot && room.day === 1) {
+    // بوت كيوبيد: كيختار زوج عشوائي من لاعبين حيين مختلفين
+    const candidates = alivePlayers(room);
+    if (candidates.length >= 2) {
+      const shuffled = shuffle(candidates);
+      const [a, b] = shuffled;
+      room.lovers = [a.id, b.id];
+      [a, b].forEach(p => { p.lover = true; });
+    }
   }
-  // السحرة والعرّافة والكيوبيد للبوتات: تخطي بسيط (ما كيأثرش سلباً على التوازن)
 }
 
 function advanceNightStep(room) {
@@ -560,7 +639,7 @@ function advanceNightStep(room) {
   const humanHolders = holders.filter(p => !p.isBot);
   const botHolders = holders.filter(p => p.isBot);
 
-  botHolders.forEach(() => botAutoNightAction(room, role));
+  botHolders.forEach(bot => botAutoNightAction(room, bot, role));
   if (role === 'WEREWOLF' && botHolders.length) scheduleWolfChat(room);
 
   if (humanHolders.length === 0) {
@@ -926,13 +1005,19 @@ io.on('connection', (socket) => {
       socket.emit('creator:error', 'ميزة المطور غير مفعّلة على هاد السيرفر');
       return;
     }
-    if (code === CREATOR_SECRET) {
+    if (isCreatorAuthBlocked(ip)) {
+      socket.emit('creator:error', 'محاولات كثيرة، عاود حاول من بعد شوية');
+      return;
+    }
+    if (typeof code === 'string' && safeCompareSecret(code)) {
+      clearCreatorAuthAttempts(ip);
       creatorSockets.add(socket.id);
       const room = findRoomBySocket(socket.id);
       socket.emit('creator:ok', { name: 'Alaa Dev' });
-      console.log(`👑 Creator authenticated: ${socket.id} (${ip})`);
+      console.log(`👑 Creator authenticated: ${socket.id}`);
       if (room) broadcastRoom(room);
     } else {
+      registerFailedCreatorAuth(ip);
       socket.emit('creator:error', 'الكود غير صحيح');
     }
   });
