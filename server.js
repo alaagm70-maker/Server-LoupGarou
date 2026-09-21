@@ -786,7 +786,8 @@ io.on('connection', (socket) => {
 
   /* ---------------- Creator auth & tools ---------------- */
 
-  socket.on('creator:auth', (code) => {
+  socket.on('creator:auth', (payload) => {
+    const code = (payload && typeof payload === 'object') ? payload.code : payload;
     if (!CREATOR_SECRET) {
       socket.emit('creator:error', 'ميزة المطور غير مفعّلة على هاد السيرفر');
       return;
@@ -794,6 +795,7 @@ io.on('connection', (socket) => {
     if (code === CREATOR_SECRET) {
       creatorSockets.add(socket.id);
       const room = findRoomBySocket(socket.id);
+      const ip = getClientIP(socket);
       socket.emit('creator:ok', { name: 'Alaa Dev' });
       console.log(`👑 Creator authenticated: ${socket.id} (${ip})`);
       if (room) broadcastRoom(room);
