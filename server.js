@@ -1,7 +1,8 @@
 /* =========================================================
-   Loup Garou — server.js
-   يطابق البروتوكول اللي كيستعملو olders.html (room:*, game:*, night:*, vote:*, chat:*)
-   + نظام Creator آمن (السر فالسيرفر فقط، عبر متغير بيئة)
+   لعبة المستذئب — server.js
+   يطابق البروتوكول الذي يستخدمه olders.html (room:*, game:*, night:*, vote:*, chat:*)
+   + نظام "المطوّر" الآمن (السرّ في الخادم فقط، عبر متغيّر بيئة)
+   + نظام المايك الحرّ الاختياري أثناء الليل والنهار (ينقطع تلقائياً عند بدء نظام الحديث بالدور)
    ========================================================= */
 const express = require('express');
 const app = express();
@@ -13,19 +14,18 @@ const io = require('socket.io')(http, {
 app.use(express.static(__dirname));
 
 /* ------------------------------------------------------------
-   Creator auth (آمن): السر كيتقارن فالسيرفر فقط.
-   خاصك تصاوب متغير بيئة قبل التشغيل، مثلاً:
+   مصادقة المطوّر (آمنة): السرّ يُقارَن في الخادم فقط.
+   يجب إنشاء متغيّر بيئة قبل التشغيل، مثلاً:
      CREATOR_SECRET=IAM-ALAA-DEVOFLOUPPY node server.js
    ------------------------------------------------------------ */
 const CREATOR_SECRET = process.env.CREATOR_SECRET || null;
 
-// socket.id ديال أي واحد أثبت أنه Creator فهاد الجلسة الحالية ديال السيرفر
+// socket.id لكل من أثبت أنه المطوّر خلال هذه الجلسة الحالية للخادم
 const creatorSockets = new Set();
 
-// IPs محظورة بشكل دائم (كتضيع لما يعاود يتشغل السيرفر — حسب الطلب)
+// عناوين IP محظورة بشكل دائم (تُفقد عند إعادة تشغيل الخادم — حسب الطلب)
 const permBannedIPs = new Set();
-// IPs محظورة مؤقتاً لهاد التشغيلة الحالية فقط لكن كتفرق عن permanent فكونها بلا فرق تقني هنا،
-// خصصنا set وحدة، والفرق كيبان غير فكيفاش كتزاد (شوف creator:ban)
+// عناوين IP محظورة مؤقتاً لهذه الجلسة الحالية فقط
 const sessionBannedIPs = new Set();
 
 function getClientIP(socket) {
@@ -44,7 +44,7 @@ function isCreator(socket) {
 
 function requireCreator(socket, cb) {
   if (!isCreator(socket)) {
-    socket.emit('creator:error', 'غير مصرح لك بهاد العملية');
+    socket.emit('creator:error', 'غير مصرَّح لك بهذه العملية');
     return false;
   }
   cb();
@@ -55,18 +55,18 @@ function requireCreator(socket, cb) {
    الأدوار
    ------------------------------------------------------------ */
 const ROLES_INFO = {
-  VILLAGER:   { name: 'فلاح',         emoji: '🧑‍🌾', color: '#2ecc71', desc: 'يصوّت نهارًا فقط',        wolf: false },
-  WEREWOLF:   { name: 'مستذئب',       emoji: '🐺',   color: '#e74c3c', desc: 'يقتل كل ليلة',            wolf: true },
-  ALPHA_WOLF: { name: 'ذئب ألفا',     emoji: '🔥🐺', color: '#ff4444', desc: 'الذئب الأقوى',            wolf: true },
-  SEER:       { name: 'عرّافة',        emoji: '🔮',   color: '#9b59b6', desc: 'ترى هوية لاعب كل ليلة',   wolf: false },
-  WITCH:      { name: 'ساحرة',        emoji: '🧙',   color: '#1abc9c', desc: 'ترياق + سم مرة واحدة',    wolf: false },
-  HUNTER:     { name: 'صيّاد',        emoji: '🏹',   color: '#f1c40f', desc: 'سهم أخير عند الموت',      wolf: false },
-  BODYGUARD:  { name: 'حارس',         emoji: '🛡️',  color: '#3498db', desc: 'يحمي لاعبًا كل ليلة',      wolf: false },
-  CUPID:      { name: 'كيوبيد',       emoji: '💘',   color: '#e91e63', desc: 'يربط عاشقَين',            wolf: false },
-  ELDER:      { name: 'شيخ القرية',   emoji: '👴',   color: '#a0522d', desc: 'يتحمل ضربة من الذئاب',    wolf: false },
-  FOOL:       { name: 'المجنون',      emoji: '🃏',   color: '#00bcd4', desc: 'يفوز إن أُعدم نهارًا',    wolf: false },
-  PLAGUE_DR:  { name: 'طبيب الطاعون', emoji: '⚗️',  color: '#7f8c8d', desc: 'يمرّض لاعبًا',            wolf: false },
-  THIEF:      { name: 'اللص',         emoji: '🥷',   color: '#e67e22', desc: 'يسرق دور لاعب آخر',       wolf: false },
+  VILLAGER:   { name: 'قروي',           emoji: '🧑‍🌾', color: '#2ecc71', desc: 'يصوّت نهاراً فقط',              wolf: false },
+  WEREWOLF:   { name: 'مستذئب',         emoji: '🐺',   color: '#e74c3c', desc: 'يقتل كل ليلة',                  wolf: true },
+  ALPHA_WOLF: { name: 'الذئب الألفا',   emoji: '🔥🐺', color: '#ff4444', desc: 'الذئب الأقوى',                  wolf: true },
+  SEER:       { name: 'العرّافة',       emoji: '🔮',   color: '#9b59b6', desc: 'ترى هوية لاعب كل ليلة',         wolf: false },
+  WITCH:      { name: 'الساحرة',        emoji: '🧙',   color: '#1abc9c', desc: 'تملك ترياقاً وسمّاً لمرة واحدة', wolf: false },
+  HUNTER:     { name: 'الصيّاد',        emoji: '🏹',   color: '#f1c40f', desc: 'يطلق سهماً أخيراً عند موته',    wolf: false },
+  BODYGUARD:  { name: 'الحارس',         emoji: '🛡️',  color: '#3498db', desc: 'يحمي لاعباً كل ليلة',           wolf: false },
+  CUPID:      { name: 'كيوبيد',         emoji: '💘',   color: '#e91e63', desc: 'يربط بين عاشقَين',              wolf: false },
+  ELDER:      { name: 'شيخ القرية',     emoji: '👴',   color: '#a0522d', desc: 'يتحمّل ضربة واحدة من الذئاب',   wolf: false },
+  FOOL:       { name: 'المجنون',        emoji: '🃏',   color: '#00bcd4', desc: 'يفوز إن أُعدم نهاراً',          wolf: false },
+  PLAGUE_DR:  { name: 'طبيب الطاعون',   emoji: '⚗️',  color: '#7f8c8d', desc: 'يُمرِض لاعباً',                 wolf: false },
+  THIEF:      { name: 'اللص',           emoji: '🥷',   color: '#e67e22', desc: 'يسرق دور لاعب آخر',            wolf: false },
 };
 
 const ROLE_DIST = {
@@ -85,31 +85,31 @@ const BOT_NAMES = ['سعيد', 'فاطمة', 'يوسف', 'خديجة', 'رشيد
 const BOT_AVATARS = ['🤖', '👽', '🐺', '🦊', '🐻', '🦁', '🐯', '🐸'];
 
 /* ------------------------------------------------------------
-   نصوص هضرة البوتات فمرحلة الهدرة (اختيار عشوائي حسب الحالة)
+   نصوص حديث البوتات في مرحلة النقاش (اختيار عشوائي حسب الحالة)
    ------------------------------------------------------------ */
 const BOT_VOICE_LINES = {
   generic: [
-    'من رأيي، خاصنا نديرو نتفكرو مزيان قبل ما نصوتو.',
-    'أنا مازال ماشدّيتش رأيي، بغيت نسمع الكل الأول.',
-    'كاين شي حاجة ماعجباتنيش فتصرف بعض الناس اليوم.',
-    'خاصنا نراقبو شكون سكت بزاف البارح.',
-    'أنا واثق فاللي كنت معاه البارح، ماكانش ذئب.',
-    'نتيجة الليلة البارحة كتبان لي مشبوهة شوية.',
+    'في رأيي، يجب أن نفكّر مليّاً قبل أن نصوّت.',
+    'لم أحسم رأيي بعد، أريد أن أستمع إلى الجميع أولاً.',
+    'ثمة أمر لا يعجبني في تصرّف بعضهم اليوم.',
+    'يجب أن نراقب من صمت كثيراً البارحة.',
+    'أنا واثق أنّ من كان معي البارحة ليس ذئباً.',
+    'نتيجة الليلة الماضية تبدو لي مريبة بعض الشيء.',
   ],
   accuse: [
-    'أنا كنشك بزاف فـ {t}، تصرفاته مريبة.',
-    'من رأيي {t} هو الذئب، خاصنا نصوتو عليه.',
-    '{t} سكت بزاف البارح، هادشي مايطمنش.',
-    'كلام {t} ماكيتوافقش مع اللي وقع البارح.',
+    'أشكّ كثيراً في {t}، تصرّفاته مريبة.',
+    'في رأيي أنّ {t} هو الذئب، يجب أن نصوّت ضدّه.',
+    '{t} صمت كثيراً البارحة، وهذا لا يطمئنني.',
+    'كلام {t} لا يتوافق مع ما جرى البارحة.',
   ],
   defend: [
-    'أنا متأكد {t} برئ، خدمنا مزيان بجوج.',
-    'ماخصكمش تشكو في {t}، ماعندوش سبب يكذب.',
-    '{t} كان معايا فنفس الوقت، مستحيل يكون هو.',
+    'أنا متأكّد أنّ {t} بريء، كنّا نعمل معاً جيّداً.',
+    'لا داعي للشكّ في {t}، لا سبب يدفعه للكذب.',
+    'كان {t} معي في الوقت نفسه، من المستحيل أن يكون هو.',
   ],
   survived_night: [
-    'الحمد لله نجيت هاد الليلة، خاصنا نبقاو منتبهين.',
-    'اللي مات البارح كان شخص مزيان، خسارة كبيرة.',
+    'الحمد لله نجونا هذه الليلة، يجب أن نبقى متيقّظين.',
+    'من ماتَ البارحة كان شخصاً طيّباً، وهذه خسارة كبيرة.',
   ],
 };
 
@@ -132,7 +132,7 @@ function pickBotLine(room, botPlayer) {
   return BOT_VOICE_LINES.generic[Math.floor(Math.random() * BOT_VOICE_LINES.generic.length)];
 }
 
-// تقدير مدة الهضرة حسب طول النص (تقريباً 100ms لكل حرف، بحدود معقولة)
+// تقدير مدة الحديث حسب طول النص (نحو 90ms لكل حرف، ضمن حدود معقولة)
 function estimateSpeechMs(text) {
   const ms = text.length * 90;
   return Math.max(2200, Math.min(ms, 9000));
@@ -164,7 +164,7 @@ function newRoom(hostSocketId) {
     phase: 'night',        // night | day
     day: 1,
     players: [],           // {id,name,avatar,role,alive,isBot,votedFor,lover}
-    nightQueue: [],        // ترتيب الأدوار اللي خاصها تتصرف هاد الليلة
+    nightQueue: [],        // ترتيب الأدوار التي يجب أن تتصرّف هذه الليلة
     nightIndex: 0,
     nightEvents: [],
     nightKillTarget: null, // هدف الذئاب
@@ -175,17 +175,25 @@ function newRoom(hostSocketId) {
     lovers: null,          // [id1, id2]
     thiefSwapped: false,
 
-    // ---- نظام "الهدرة" (voice discussion room) ----
+    // هل فعّل المضيف المايك الحرّ أثناء الليل والنهار؟ (يُحدَّد في غرفة الانتظار قبل البدء)
+    freeMicEnabled: false,
+
+    // ---- نظام "النقاش بالدور" (غرفة الحديث الصوتي المرتَّب A→Z) ----
     voice: {
-      active: false,        // واش الهدرة مفتوحة دابا
-      order: [],            // [ids] ترتيب A→Z ديال اللاعبين الأحياء
-      turnIndex: -1,        // index ديال اللي عليه الدور دابا فـ order
-      turnId: null,         // socket.id (أو bot id) ديال صاحب الدور
-      silenceTimer: null,   // setTimeout ديال auto-skip بالصمت (بشر فقط)
-      botTimer: null,       // setTimeout ديال دور البوت الحالي
-      lastActivityAt: 0,    // آخر وقت وصلت فيه نبضة صوت من صاحب الدور
-      announceTimer: null,  // مؤقت "تجهزوا"
-      startTimer: null,     // مؤقت بداية الهدرة
+      active: false,        // هل النقاش مفتوح الآن
+      order: [],            // [ids] ترتيب أبجدي للاعبين الأحياء
+      turnIndex: -1,        // فهرس صاحب الدور الحالي في order
+      turnId: null,         // socket.id (أو معرّف البوت) لصاحب الدور
+      silenceTimer: null,   // مؤقّت التخطّي التلقائي عند الصمت (للبشر فقط)
+      botTimer: null,       // مؤقّت دور البوت الحالي
+      lastActivityAt: 0,    // آخر وقت وصلت فيه إشارة صوت من صاحب الدور
+      announceTimer: null,  // مؤقّت "استعدّوا"
+      startTimer: null,     // مؤقّت بدء النقاش
+    },
+
+    // ---- المايك الحرّ (حديث مفتوح لجميع اللاعبين الأحياء أثناء الليل والنهار) ----
+    freeMic: {
+      active: false,       // هل المايك الحرّ مفتوح الآن
     },
   };
 }
@@ -211,6 +219,8 @@ function roomPublicState(room) {
     state: room.state,
     phase: room.phase,
     day: room.day,
+    host: room.hostId,
+    freeMicEnabled: !!room.freeMicEnabled,
     players: room.players.map(publicPlayer),
   };
 }
@@ -264,7 +274,7 @@ function sendRolesToPlayers(room) {
 }
 
 function nightActingOrder(room) {
-  // ترتيب منطقي: كيوبيد (ليلة 1 فقط) → حارس → ذئاب → عرّافة → ساحرة → طبيب الطاعون
+  // ترتيب منطقي: كيوبيد (الليلة الأولى فقط) → الحارس → الذئاب → العرّافة → الساحرة → طبيب الطاعون
   const order = [];
   if (room.day === 1) order.push('CUPID');
   order.push('BODYGUARD', 'WEREWOLF', 'SEER', 'WITCH', 'PLAGUE_DR');
@@ -279,6 +289,24 @@ function nightActingOrder(room) {
   return result;
 }
 
+/* ------------------------------------------------------------
+   المايك الحرّ — يُفتح في بداية الليل والنهار (إن كان مفعّلاً من المضيف)
+   ويُغلَق تلقائياً بمجرّد بدء نظام النقاش بالدور
+   ------------------------------------------------------------ */
+function startFreeMic(room) {
+  if (!room.freeMicEnabled) return;
+  if (room.freeMic.active) return;
+  room.freeMic.active = true;
+  const participants = alivePlayers(room).filter(p => !p.isBot).map(publicPlayer);
+  io.to(room.code).emit('freemic:start', { participants, phase: room.phase });
+}
+
+function stopFreeMic(room) {
+  if (!room.freeMic.active) return;
+  room.freeMic.active = false;
+  io.to(room.code).emit('freemic:stop', {});
+}
+
 function startNight(room) {
   clearVoiceTimers(room);
   if (room.voice.announceTimer) { clearTimeout(room.voice.announceTimer); room.voice.announceTimer = null; }
@@ -286,6 +314,7 @@ function startNight(room) {
   room.voice.active = false;
   room.voice.turnId = null;
   room.voice.turnIndex = -1;
+  stopFreeMic(room);
 
   room.phase = 'night';
   room.nightKillTarget = null;
@@ -297,12 +326,12 @@ function startNight(room) {
   room.nightEvents = [];
   io.to(room.code).emit('phase:night', { day: room.day });
   broadcastRoom(room);
+  startFreeMic(room);
   advanceNightStep(room);
 }
 
 function botAutoNightAction(room, role) {
-  // بوتات كيديرو أكشن عشوائي بسيط باش الليلة توصل للفجر
-  const targets = alivePlayers(room).filter(p => p.role !== role || role !== 'WEREWOLF');
+  // البوتات تقوم بأكشن عشوائي بسيط حتى تصل الليلة إلى الفجر
   if (role === 'WEREWOLF') {
     const candidates = villagersOf(room);
     if (candidates.length) room.nightKillTarget = candidates[Math.floor(Math.random() * candidates.length)].id;
@@ -313,7 +342,7 @@ function botAutoNightAction(room, role) {
     const candidates = alivePlayers(room);
     if (candidates.length && Math.random() > 0.5) room.plagueSickId = candidates[Math.floor(Math.random() * candidates.length)].id;
   }
-  // السحرة والعرّافة والكيوبيد للبوتات: تخطي بسيط (ما كيأثرش سلباً على التوازن)
+  // الساحرة والعرّافة وكيوبيد بالنسبة للبوتات: تخطٍّ بسيط (لا يؤثر سلباً على التوازن)
 }
 
 function advanceNightStep(room) {
@@ -362,7 +391,8 @@ function advanceNightStep(room) {
     }
   });
 
-  // بوتات باقيين فأدوار أخرى فحال ماكانش بشر فهاد الدور، صافي — كيتسناو submit ديال البشر
+  // البوتات المتبقّية في أدوار أخرى: إن لم يكن هناك بشر في هذا الدور، ننتقل مباشرة —
+  // وإلا ننتظر استجابة البشر (submit)
   room._pendingRole = role;
   room._pendingHumans = new Set(humanHolders.map(p => p.id));
 }
@@ -379,7 +409,7 @@ function resolveNight(room) {
     if (target && target.alive && !blocked) {
       if (target.role === 'ELDER' && !target._elderHitOnce) {
         target._elderHitOnce = true;
-        events.push(`👴 ${target.name} (شيخ القرية) صمد أمام هجوم الذئاب!`);
+        events.push(`👴 صمد ${target.name} (شيخ القرية) أمام هجوم الذئاب!`);
       } else {
         target.alive = false;
         events.push(`💀 وُجد ${target.name} (${roleInfo(target.role).name}) ميتاً عند الفجر!`);
@@ -393,7 +423,7 @@ function resolveNight(room) {
     const t = room.players.find(p => p.id === room._witchPoisonTarget);
     if (t && t.alive) {
       t.alive = false;
-      events.push(`☠️ الساحرة سمّت ${t.name}!`);
+      events.push(`☠️ سمَّت الساحرة ${t.name}!`);
       killLoverIfNeeded(room, t, events);
       if (t.role === 'HUNTER') notifyHunter(room, t);
     }
@@ -403,6 +433,7 @@ function resolveNight(room) {
   if (!events.length) events.push('🌙 ليلة هادئة، لم يمت أحد.');
 
   room.nightEvents = events;
+  stopFreeMic(room);
   io.to(room.code).emit('phase:dawn', { events, day: room.day });
 
   const win = checkWin(room);
@@ -419,7 +450,7 @@ function killLoverIfNeeded(room, deadPlayer, events) {
   const other = room.players.find(p => p.id === otherId);
   if (other && other.alive) {
     other.alive = false;
-    events.push(`💔 ${other.name} مات حزناً على حبيبه!`);
+    events.push(`💔 مات ${other.name} حزناً على حبيبه!`);
   }
 }
 
@@ -434,12 +465,13 @@ function startDay(room) {
   room.players.forEach(p => { p.votedFor = null; });
   io.to(room.code).emit('phase:day', { day: room.day });
   broadcastRoom(room);
+  startFreeMic(room);
 
-  // t=10s: تنبيه "تجهزوا" | t=30s: بداية الهدرة الصوتية
+  // t=10ث: تنبيه "استعدّوا" | t=30ث: بدء النقاش الصوتي بالدور (يقطع المايك الحرّ تلقائياً)
   room.voice.announceTimer = setTimeout(() => {
     if (room.state !== 'playing' || room.phase !== 'day') return;
     io.to(room.code).emit('voice:announce', {
-      message: 'يوجد بعض الكلمات يجب قولها شفهياً. تجهزوا 🎙️',
+      message: 'ثمة كلمات يجب أن تُقال شفهياً. استعدّوا 🎙️',
     });
   }, 10000);
 
@@ -450,7 +482,7 @@ function startDay(room) {
 }
 
 /* ------------------------------------------------------------
-   نظام "الهدرة" — دور A→Z، مايك واحد مفتوح فكل مرة
+   نظام "النقاش بالدور" — دور A→Z، مايك واحد مفتوح في كل مرة
    ------------------------------------------------------------ */
 function clearVoiceTimers(room) {
   const v = room.voice;
@@ -459,8 +491,11 @@ function clearVoiceTimers(room) {
 }
 
 function startVoicePhase(room) {
+  // إغلاق المايك الحرّ تلقائياً بمجرّد وصول موعد نظام النقاش بالدور
+  stopFreeMic(room);
+
   const v = room.voice;
-  // ترتيب أبجدي (A→Z) على اللاعبين الأحياء فقط، بغض النظر عن بشر/بوت
+  // ترتيب أبجدي (A→Z) على اللاعبين الأحياء فقط، بغضّ النظر عن كونهم بشراً أو بوتات
   v.order = alivePlayers(room)
     .map(p => p.id)
     .sort((a, b) => {
@@ -485,7 +520,7 @@ function advanceVoiceTurn(room) {
 
   v.turnIndex++;
 
-  // تخطي أي لاعب مات فالأثناء
+  // تخطّي أيّ لاعب مات في الأثناء
   while (v.turnIndex < v.order.length) {
     const p = room.players.find(x => x.id === v.order[v.turnIndex]);
     if (p && p.alive) break;
@@ -508,7 +543,7 @@ function advanceVoiceTurn(room) {
   });
 
   if (player.isBot) {
-    // البوت كيهضر: نبعثو النص لجميع اللاعبين، الفرونت كيدير TTS + أنيميشن الكتابة تزامنياً
+    // البوت يتحدّث: نبعث النصّ لجميع اللاعبين، والواجهة الأمامية تقوم بتحويله إلى كلام (TTS) مع أنيميشن الكتابة تزامناً
     const line = pickBotLine(room, player);
     const durationMs = estimateSpeechMs(line);
     io.to(room.code).emit('voice:botSpeak', {
@@ -518,7 +553,7 @@ function advanceVoiceTurn(room) {
     });
     v.botTimer = setTimeout(() => advanceVoiceTurn(room), durationMs + 700);
   } else {
-    // بشري: نتسناو "كملت؟" أو 60 ثانية صمت (VAD) قبل ما نتخطاو تلقائياً
+    // بشري: ننتظر "انتهيت؟" أو 60 ثانية صمت (كشف نشاط صوتي) قبل التخطّي التلقائي
     v.silenceTimer = setTimeout(() => {
       checkSilenceTimeout(room, player.id);
     }, 60000);
@@ -533,7 +568,7 @@ function checkSilenceTimeout(room, expectedPlayerId) {
     io.to(room.code).emit('voice:autoSkip', { playerId: expectedPlayerId });
     advanceVoiceTurn(room);
   } else {
-    // كاين نشاط جا مؤخراً، نعاود نحسبو الوقت المتبقي
+    // وصل نشاط مؤخّراً، نعيد حساب الوقت المتبقّي
     v.silenceTimer = setTimeout(() => checkSilenceTimeout(room, expectedPlayerId), 60000 - idleFor);
   }
 }
@@ -554,7 +589,7 @@ function openVote(room) {
   alivePlayers(room).filter(p => !p.isBot).forEach(p => {
     io.to(p.id).emit('vote:open', { candidates: candidates.filter(c => c.id !== p.id) });
   });
-  // بوتات كيصوتو عشوائياً
+  // البوتات تصوّت عشوائياً
   alivePlayers(room).filter(p => p.isBot).forEach(p => {
     const options = alivePlayers(room).filter(x => x.id !== p.id);
     if (options.length) p.votedFor = options[Math.floor(Math.random() * options.length)].id;
@@ -606,6 +641,7 @@ function checkWin(room) {
 function endGame(room, winner) {
   clearVoiceTimers(room);
   room.voice.active = false;
+  stopFreeMic(room);
   room.state = 'ended';
   io.to(room.code).emit('game:end', {
     winner,
@@ -614,17 +650,17 @@ function endGame(room, winner) {
 }
 
 /* ------------------------------------------------------------
-   Socket handlers
+   معالجات Socket
    ------------------------------------------------------------ */
 io.on('connection', (socket) => {
   const ip = getClientIP(socket);
   if (isBannedIP(ip)) {
-    socket.emit('room:error', 'أنت محظور من هاد اللعبة');
+    socket.emit('room:error', 'أنت محظور من هذه اللعبة');
     socket.disconnect(true);
     return;
   }
 
-  console.log(`✅ متصل: ${socket.id} (${ip})`);
+  console.log(`✅ اتصال جديد: ${socket.id} (${ip})`);
 
   socket.on('room:create', ({ playerName }) => {
     const room = newRoom(socket.id);
@@ -652,16 +688,25 @@ io.on('connection', (socket) => {
     broadcastRoom(room);
   });
 
+  // المضيف يفعّل أو يعطّل المايك الحرّ أثناء الليل والنهار (قبل بدء اللعبة، في غرفة الانتظار)
+  socket.on('room:setFreeMic', ({ enabled }) => {
+    const room = findRoomBySocket(socket.id);
+    if (!room || room.hostId !== socket.id) return;
+    if (room.state !== 'lobby') return;
+    room.freeMicEnabled = !!enabled;
+    broadcastRoom(room);
+  });
+
   socket.on('game:start', () => {
     const room = findRoomBySocket(socket.id);
     if (!room || room.hostId !== socket.id) return;
     if (room.players.filter(p => !p.isBot).length < 2) {
-      socket.emit('room:error', 'خاصك لاعب آخر واحد على الأقل باش تبدا');
+      socket.emit('room:error', 'يجب أن يكون هناك لاعب آخر واحد على الأقلّ لبدء اللعبة');
       return;
     }
     addBotsToRoom(room);
     if (room.players.length < MIN_PLAYERS) {
-      socket.emit('room:error', `خاص ${MIN_PLAYERS} لاعبين على الأقل`);
+      socket.emit('room:error', `يجب توفّر ${MIN_PLAYERS} لاعبين على الأقلّ`);
       return;
     }
     assignRoles(room);
@@ -733,7 +778,7 @@ io.on('connection', (socket) => {
     const t = room.players.find(p => p.id === targetId);
     if (!t || !t.alive) return;
     t.alive = false;
-    const evts = [`🏹 الصيّاد أطلق سهمه على ${t.name}!`];
+    const evts = [`🏹 أطلق الصيّاد سهمه على ${t.name}!`];
     killLoverIfNeeded(room, t, evts);
     io.to(room.code).emit('phase:dawn', { events: evts, day: room.day });
     broadcastRoom(room);
@@ -744,7 +789,7 @@ io.on('connection', (socket) => {
   socket.on('chat:send', ({ text }) => {
     const room = findRoomBySocket(socket.id);
     if (!room) return;
-    if (room.voice.active) return; // الشات النصي مقفل فمدة الهدرة الصوتية
+    if (room.voice.active) return; // الدردشة النصّية مقفلة أثناء النقاش الصوتي بالدور
     const player = room.players.find(p => p.id === socket.id);
     if (!player || !player.alive) return;
     if (!text || !String(text).trim()) return;
@@ -757,9 +802,9 @@ io.on('connection', (socket) => {
     }
   });
 
-  /* ---------------- نظام الهدرة الصوتية ---------------- */
+  /* ---------------- نظام النقاش الصوتي بالدور ---------------- */
 
-  // اللاعب صاحب الدور يضغط "كملت؟"
+  // صاحب الدور يضغط "انتهيت؟"
   socket.on('voice:next', () => {
     const room = findRoomBySocket(socket.id);
     if (!room || !room.voice.active) return;
@@ -767,7 +812,7 @@ io.on('connection', (socket) => {
     advanceVoiceTurn(room);
   });
 
-  // نبضة نشاط صوتي (VAD) من صاحب الدور — كتوصل من الفرونت كل ما كيهضر
+  // إشارة نشاط صوتي (VAD) من صاحب الدور — تصل من الواجهة الأمامية كلّما تحدّث
   socket.on('voice:activity', () => {
     const room = findRoomBySocket(socket.id);
     if (!room || !room.voice.active) return;
@@ -775,7 +820,7 @@ io.on('connection', (socket) => {
     room.voice.lastActivityAt = Date.now();
   });
 
-  // WebRTC signaling relay بين اللاعبين (offer/answer/ice)
+  // ترحيل إشارات WebRTC (offer/answer/ice) بين اللاعبين — يُستخدَم لكل من نظام النقاش بالدور والمايك الحرّ
   socket.on('voice:signal', ({ to, data }) => {
     const room = findRoomBySocket(socket.id);
     if (!room || !to) return;
@@ -784,12 +829,12 @@ io.on('connection', (socket) => {
     io.to(to).emit('voice:signal', { from: socket.id, data });
   });
 
-  /* ---------------- Creator auth & tools ---------------- */
+  /* ---------------- مصادقة وأدوات المطوّر ---------------- */
 
   socket.on('creator:auth', (payload) => {
     const code = (payload && typeof payload === 'object') ? payload.code : payload;
     if (!CREATOR_SECRET) {
-      socket.emit('creator:error', 'ميزة المطور غير مفعّلة على هاد السيرفر');
+      socket.emit('creator:error', 'ميزة المطوّر غير مفعّلة على هذا الخادم');
       return;
     }
     if (code === CREATOR_SECRET) {
@@ -797,10 +842,10 @@ io.on('connection', (socket) => {
       const room = findRoomBySocket(socket.id);
       const ip = getClientIP(socket);
       socket.emit('creator:ok', { name: 'Alaa Dev' });
-      console.log(`👑 Creator authenticated: ${socket.id} (${ip})`);
+      console.log(`👑 تمّت مصادقة المطوّر: ${socket.id} (${ip})`);
       if (room) broadcastRoom(room);
     } else {
-      socket.emit('creator:error', 'الكود غير صحيح');
+      socket.emit('creator:error', 'الرمز غير صحيح');
     }
   });
 
@@ -828,28 +873,26 @@ io.on('connection', (socket) => {
       if (!room) return;
       const idx = room.players.findIndex(p => p.id === targetId);
       if (idx === -1) return;
-      const kicked = room.players[idx];
-      io.to(targetId).emit('room:error', 'تم طردك من قِبل المطور');
+      io.to(targetId).emit('room:error', 'تمّ طردك من قِبل المطوّر');
       room.players.splice(idx, 1);
       broadcastRoom(room);
     });
   });
 
-  // حظر: type = 'session' (يقدر يرجع يدخل من بعد) أو 'permanent' (حتى يتعاود تشغيل السيرفر)
+  // حظر: type = 'session' (يمكنه العودة للدخول لاحقاً) أو 'permanent' (حتى إعادة تشغيل الخادم)
   socket.on('creator:ban', ({ targetId, type }) => {
     requireCreator(socket, () => {
       const room = findRoomBySocket(socket.id);
       if (!room) return;
       const idx = room.players.findIndex(p => p.id === targetId);
       if (idx === -1) return;
-      const target = room.players[idx];
       const targetSocket = io.sockets.sockets.get(targetId);
       const targetIP = targetSocket ? getClientIP(targetSocket) : null;
       if (targetIP) {
         if (type === 'permanent') permBannedIPs.add(targetIP);
         else sessionBannedIPs.add(targetIP);
       }
-      io.to(targetId).emit('room:error', type === 'permanent' ? 'تم حظرك بشكل دائم' : 'تم حظرك من قِبل المطور');
+      io.to(targetId).emit('room:error', type === 'permanent' ? 'تمّ حظرك بشكل دائم' : 'تمّ حظرك من قِبل المطوّر');
       if (targetSocket) targetSocket.disconnect(true);
       room.players.splice(idx, 1);
       broadcastRoom(room);
@@ -903,6 +946,9 @@ io.on('connection', (socket) => {
     requireCreator(socket, () => {
       const room = findRoomBySocket(socket.id);
       if (!room) return;
+      clearVoiceTimers(room);
+      room.voice.active = false;
+      stopFreeMic(room);
       room.state = 'lobby'; room.phase = 'night'; room.day = 1;
       room.players.forEach(p => { p.role = null; p.alive = true; p.votedFor = null; p.lover = false; });
       broadcastRoom(room);
@@ -918,7 +964,7 @@ io.on('connection', (socket) => {
     const left = room.players[idx];
     const wasVoiceTurn = room.voice.active && room.voice.turnId === socket.id;
     room.players.splice(idx, 1);
-    console.log(`❌ ${left.name} غادر الغرفة ${room.code}`);
+    console.log(`❌ غادر ${left.name} الغرفة ${room.code}`);
     if (room.players.length === 0) {
       clearVoiceTimers(room);
       rooms.delete(room.code);
@@ -931,9 +977,12 @@ io.on('connection', (socket) => {
       io.to(room.code).emit('voice:playerLeft', { playerId: socket.id });
       if (wasVoiceTurn) advanceVoiceTurn(room);
     }
+    if (room.freeMic.active) {
+      io.to(room.code).emit('freemic:playerLeft', { playerId: socket.id });
+    }
     broadcastRoom(room);
   });
 });
 
 const PORT = process.env.PORT || 3000;
-http.listen(PORT, () => console.log(`🐺 السيرفر شغّال: http://localhost:${PORT}`));
+http.listen(PORT, () => console.log(`🐺 الخادم يعمل: http://localhost:${PORT}`));
