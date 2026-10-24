@@ -8,35 +8,29 @@
  *  - أي لاعب يدخل جديد (أو عنده refresh) يطلب الحالة الحالية فيتزامن مباشرة مع البقية
  *    (السيرفر يحسب الوقت المنقضي من وقت البداية ويرسله، باش الكلاينت يقدر "يقفز" لنفس النقطة).
  *
- * مكتبة الأغاني تُقرأ مباشرة من فولدر "music" الموجود جنب هاذ الملف (أو مسار تحدده إنت):
- *   music/
- *     اغنية1.mp3
- *     اغنية2.mp3
- *     ...
- * السيرفر يفحص الفولدر، ياخذ أسماء الملفات (بلا الامتداد) كعناوين، ويخدمها كـ static files
- * باش الكلاينت يقدر يشغّلها من رابط زي: /music/اغنية1.mp3
+ * مكتبة الأغاني تُجلب من رابط خارجي (افتراضياً https://loupmusic.surge.sh) بدل فولدر محلي:
+ *  1) يجرب أولاً يقرا صفحة الرابط كاملة (HTML) ويلقط كل الروابط اللي تنتهي بامتداد صوت
+ *     (.mp3, .wav, .ogg, .m4a, .flac, .aac, .opus) — هاذي تخدم تلقائياً إذا عندك index.html
+ *     فصفحة surge يحتوي روابط لكل الأغاني (<a href="song1.mp3">...</a>).
+ *  2) إذا ما لقاش شي حاجة، يجرب يقرا ملف manifest باسم songs.json أو music.json فنفس الرابط
+ *     (مثال: https://loupmusic.surge.sh/songs.json) يحتوي مصفوفة JSON بأسماء/روابط الأغاني.
+ *  3) النتائج تتخزن فكاش لمدة قصيرة (CACHE_TTL_MS) باش ما تولّيش تطلب من surge فكل بحث.
+ *
+ *  ملاحظة: يحتاج Node.js 18+ (باش fetch تكون موجودة بصفة built-in). إذا عندك نسخة أقدم،
+ *  ثبت node-fetch وبدّل fetch(...) بـ require('node-fetch')(...).
  *
  * الاستخدام في server.js متاعك:
  *
- *   const path = require('path');
  *   const { attachMusicServer } = require('./music-server');
- *
- *   // 1) يخدم ملفات الأغاني بصفة static باش الكلاينت يقدر يشغّلها عبر رابط
- *   app.use('/music', express.static(path.join(__dirname, 'music')));
- *
- *   // 2) يربط منطق المزامنة + البحث
  *   const io = new Server(httpServer, { ... });
  *   attachMusicServer(io, {
- *     musicDir: path.join(__dirname, 'music'), // الفولدر اللي فيه الأغاني
- *     musicBaseUrl: '/music',                  // نفس المسار اللي خدمتو بـ express.static
+ *     remoteMusicUrl: 'https://loupmusic.surge.sh', // رابط فيه الأغاني (اختياري، هاذا الافتراضي)
  *   });
  *
  */
 
-const fs = require('fs');
-const path = require('path');
-
-const AUDIO_EXTENSIONS = new Set(['.mp3', '.wav', '.ogg', '.m4a', '.flac', '.aac', '.opus']);
+const REMOTE_AUDIO_EXT_REGEX = /\.(mp3|wav|ogg|m4a|flac|aac|opus)(?:[?#]|$)/i;
+const HREF_REGEX = /href\s*=\s*["']([^"']+)["']/gi;
 
 function attachMusicServer(io, options = {}) {
   // الحالة الحالية لكل غرفة: roomId -> { trackId, trackUrl, title, cover, addedByName, startedAt, isPlaying, queue }
@@ -45,46 +39,115 @@ function attachMusicServer(io, options = {}) {
   // باش تحدد شكون يقدر يبدّل الأغنية: 'anyone' | 'host-only'
   const permission = options.permission || 'anyone';
 
-  // فولدر الأغاني على القرص، والمسار اللي تُخدم بيه (لازم يطابق express.static متاعك)
-  const musicDir = options.musicDir || path.join(__dirname, 'music');
-  const musicBaseUrl = options.musicBaseUrl || '/music';
+  // الرابط اللي فيه الأغاني
+  const remoteMusicUrl = (options.remoteMusicUrl || 'https://loupmusic.surge.sh').replace(/\/$/, '');
 
-  // كاش داخلي للمكتبة باش ما نقراوش الفولدر فكل طلب بحث
+  // كاش داخلي للمكتبة باش ما نطلبوش من surge فكل بحث
   let libraryCache = [];
   let libraryCacheAt = 0;
-  const CACHE_TTL_MS = 5000; // يعاود يقرا الفولدر كل 5 ثواني بالكثير (باش يكتشف أغاني جداد تزادو)
+  const CACHE_TTL_MS = options.cacheTtlMs || 20000; // يعاود يجلب كل 20 ثانية بالكثير
 
-  function scanMusicLibrary() {
+  function fileNameFromUrl(u) {
+    try {
+      const clean = u.split('?')[0].split('#')[0];
+      return decodeURIComponent(clean.split('/').filter(Boolean).pop() || '');
+    } catch {
+      return u;
+    }
+  }
+
+  function titleFromFileName(fileName) {
+    return fileName.replace(/\.[^./]+$/, '');
+  }
+
+  function normalizeManifestEntry(entry) {
+    if (typeof entry === 'string') {
+      const url = new URL(entry, remoteMusicUrl + '/').toString();
+      const fileName = fileNameFromUrl(url);
+      return { id: url, title: titleFromFileName(fileName), url, cover: null };
+    }
+    if (entry && typeof entry === 'object') {
+      const rawUrl = entry.url || entry.file || entry.src || '';
+      if (!rawUrl) return null;
+      const url = new URL(rawUrl, remoteMusicUrl + '/').toString();
+      const fileName = fileNameFromUrl(url);
+      return {
+        id: entry.id || url,
+        title: entry.title || titleFromFileName(fileName),
+        url,
+        cover: entry.cover || null,
+      };
+    }
+    return null;
+  }
+
+  // يحاول يقرا manifest (songs.json أو music.json) فجذر الرابط
+  async function fetchManifestLibrary() {
+    for (const name of ['songs.json', 'music.json']) {
+      try {
+        const res = await fetch(remoteMusicUrl + '/' + name);
+        if (!res.ok) continue;
+        const data = await res.json();
+        if (Array.isArray(data)) {
+          return data.map(normalizeManifestEntry).filter(Boolean);
+        }
+      } catch {
+        // تجاهل ونجرب التالي
+      }
+    }
+    return [];
+  }
+
+  // يحاول يقرا صفحة HTML فجذر الرابط ويلقط كل الروابط اللي تؤدي لملفات صوت
+  async function fetchHtmlLinkedLibrary() {
+    try {
+      const res = await fetch(remoteMusicUrl + '/');
+      if (!res.ok) return [];
+      const html = await res.text();
+      const found = new Map();
+      let m;
+      HREF_REGEX.lastIndex = 0;
+      while ((m = HREF_REGEX.exec(html))) {
+        const href = m[1];
+        if (!REMOTE_AUDIO_EXT_REGEX.test(href)) continue;
+        const url = new URL(href, remoteMusicUrl + '/').toString();
+        if (found.has(url)) continue;
+        const fileName = fileNameFromUrl(url);
+        found.set(url, { id: url, title: titleFromFileName(fileName), url, cover: null });
+      }
+      return [...found.values()];
+    } catch (err) {
+      console.warn(`[music-server] تعذر جلب المكتبة من ${remoteMusicUrl}:`, err.message);
+      return [];
+    }
+  }
+
+  async function scanMusicLibrary() {
     const now = Date.now();
     if (now - libraryCacheAt < CACHE_TTL_MS && libraryCache.length) {
       return libraryCache;
     }
-    let files = [];
-    try {
-      files = fs.readdirSync(musicDir);
-    } catch (err) {
-      console.warn(`[music-server] تعذر قراءة فولدر الأغاني (${musicDir}):`, err.message);
-      libraryCache = [];
-      libraryCacheAt = now;
-      return libraryCache;
-    }
 
-    libraryCache = files
-      .filter((f) => AUDIO_EXTENSIONS.has(path.extname(f).toLowerCase()))
-      .map((f) => {
-        const title = path.basename(f, path.extname(f));
-        return {
-          id: f,                                  // اسم الملف كاملاً = معرّف فريد
-          title,                                   // اسم الأغنية بلا الامتداد
-          url: musicBaseUrl + '/' + encodeURIComponent(f),
-          cover: null,                             // حط رابط صورة هنا إذا عندك واحدة بنفس الاسم
-        };
-      });
+    const [manifestTracks, htmlTracks] = await Promise.all([
+      fetchManifestLibrary(),
+      fetchHtmlLinkedLibrary(),
+    ]);
+
+    const merged = new Map();
+    [...manifestTracks, ...htmlTracks].forEach((t) => {
+      if (t && t.url && !merged.has(t.url)) merged.set(t.url, t);
+    });
+
+    libraryCache = [...merged.values()];
     libraryCacheAt = now;
+
+    if (!libraryCache.length) {
+      console.warn(`[music-server] ما لقيتش أي أغاني فـ ${remoteMusicUrl} — تأكد كاين index.html فيه روابط للأغاني أو ملف songs.json`);
+    }
     return libraryCache;
   }
 
-  // نقرا الفولدر مرة أول باش الكاش ما يكونش فارغ قبل أول بحث
+  // يجلب المكتبة مرة أول عند تشغيل السيرفر باش تكون جاهزة قبل أول بحث
   scanMusicLibrary();
 
   function getOrCreateRoom(roomId) {
@@ -171,19 +234,20 @@ function attachMusicServer(io, options = {}) {
       broadcastState(roomId);
     });
 
-    // البحث عن أغاني: يقرا فولدر music ويرجع كل الأغاني (أو المطابقة للكلمة المكتوبة)
-    socket.on('music:search', ({ query } = {}) => {
-      const lib = scanMusicLibrary();
+    // البحث عن أغاني: يجلب من loupmusic.surge.sh (أو الرابط اللي حددتو) ويرجع كل الأغاني
+    // (أو المطابقة للكلمة المكتوبة إذا كتب المستخدم شي حاجة)
+    socket.on('music:search', async ({ query } = {}) => {
+      const lib = await scanMusicLibrary();
       const q = (query || '').trim().toLowerCase();
       const results = !q
-        ? lib // بلا بحث: يبعث كل الأغاني الموجودة فالفولدر
+        ? lib // بلا بحث: يبعث كل الأغاني الموجودة فالرابط
         : lib.filter((t) => t.title.toLowerCase().includes(q));
       socket.emit('music:searchResults', { results });
     });
 
     // يرجع المكتبة كاملة مباشرة (بلا بحث) — مفيد عند فتح لوحة البحث لأول مرة
-    socket.on('music:library', () => {
-      socket.emit('music:searchResults', { results: scanMusicLibrary() });
+    socket.on('music:library', async () => {
+      socket.emit('music:searchResults', { results: await scanMusicLibrary() });
     });
 
     // إيقاف مؤقت
